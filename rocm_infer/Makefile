@@ -11,10 +11,13 @@ TARGET = infer
 tokenizer_impl.o: tokenizer_impl.c ../metal_infer/tokenizer.h
 	gcc -O2 -c tokenizer_impl.c -o tokenizer_impl.o
 
-$(TARGET): infer.hip kernels.hip.h ../metal_infer/tokenizer.h tokenizer_impl.o
-	$(HIPCC) $(CFLAGS) -o $(TARGET) infer.hip tokenizer_impl.o $(LDFLAGS)
+infer.o: infer.hip kernels.hip.h ../metal_infer/tokenizer.h
+	$(HIPCC) $(CFLAGS) -c infer.hip -o infer.o
+
+$(TARGET): infer.o tokenizer_impl.o
+	$(HIPCC) $(CFLAGS) -o $(TARGET) infer.o tokenizer_impl.o $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET) tokenizer_impl.o
+	rm -f $(TARGET) infer.o tokenizer_impl.o
 
 .PHONY: clean
