@@ -3,7 +3,21 @@ HIPCC = hipcc
 # gfx1100 = RX 7900 XTX (RDNA 3, wavefront-32)
 # gfx1201 = RX 9070 XT (RDNA 4, wavefront-32)
 GPU_TARGETS ?= gfx942
-CFLAGS = -O2 --offload-arch=$(GPU_TARGETS)
+
+# Wavefront size must be explicit: __gfx942__ / __gfx1100__ macros are only
+# defined in the device pass, but kernel launch dims (dim3 block(WARP_SIZE,..))
+# are evaluated in host code, so host and device must agree at compile time.
+ifeq ($(GPU_TARGETS),gfx942)
+  WARP_SIZE ?= 64
+else ifeq ($(GPU_TARGETS),gfx940)
+  WARP_SIZE ?= 64
+else ifeq ($(GPU_TARGETS),gfx941)
+  WARP_SIZE ?= 64
+else
+  WARP_SIZE ?= 32
+endif
+
+CFLAGS = -O2 --offload-arch=$(GPU_TARGETS) -DWARP_SIZE=$(WARP_SIZE)
 LDFLAGS = -lpthread
 
 TARGET = infer
