@@ -38,3 +38,4 @@ c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.91	0	5.5	discard	Expert file cluster
 12e6ca0	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.29	0	5.5	keep	C/HIP gfx1151 baseline: warm cache, 30 tokens, ENABLE_VRAM_CACHE=20480 (Strix Halo)
 12e6ca0	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.74	0	5.5	keep	C/HIP gfx1151 baseline: warm cache, 100 tokens, ENABLE_VRAM_CACHE=20480 (Strix Halo)
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.70	0	5.5	keep	C/HIP gfx1151: hipMallocManaged for expert buf, removes H2D copy on UMA (warm, no VRAM cache). +16% vs baseline
+c9b04ba	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.44	0	5.5	discard	C/HIP gfx1151: hipMemAdvise SetPreferredLocation+SetAccessedBy — noisy runs, slight regression (-4 to -10% on warm no-cache). Page migration overhead on APU
