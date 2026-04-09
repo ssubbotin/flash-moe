@@ -1020,6 +1020,10 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
                    alloc / (1024.0*1024*1024),
                    100.0 * model->vram_cache_capacity / (NUM_LAYERS * NUM_EXPERTS));
         } else {
+            // Cache disabled — still initialize cache_map so the lookup at
+            // forward time always sees -1 (no hit) and cache_slots is NULL.
+            memset(model->cache_map, -1, sizeof(model->cache_map));
+            model->cache_slots = NULL;
             printf("[init] VRAM expert cache: disabled%s\n", skip_cache ? " by env" : " (not enough VRAM)");
         }
     }

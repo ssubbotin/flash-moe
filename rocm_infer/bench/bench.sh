@@ -20,10 +20,17 @@ if [[ "$MODE" == "cold" ]]; then
     echo 3 > /proc/sys/vm/drop_caches
 fi
 
-if [[ "$VRAM_MIB" != "0" ]]; then
-    export ENABLE_VRAM_CACHE="$VRAM_MIB"
+# The infer binary's only VRAM-cache control knob is DISABLE_VRAM_CACHE. When
+# set (any value) the cache is skipped entirely; otherwise the cache claims all
+# free VRAM minus 1 GB. The legacy ENABLE_VRAM_CACHE=<mib> interface is not
+# honored by the binary — we keep the $VRAM_MIB positional argument as a
+# boolean toggle (0 = off, non-zero = on) for compatibility with the apu_infer
+# script signature.
+unset ENABLE_VRAM_CACHE
+if [[ "$VRAM_MIB" == "0" ]]; then
+    export DISABLE_VRAM_CACHE=1
 else
-    unset ENABLE_VRAM_CACHE
+    unset DISABLE_VRAM_CACHE
 fi
 
 LOG=$(mktemp /tmp/bench.XXXXXX.log)

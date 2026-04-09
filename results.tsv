@@ -32,7 +32,8 @@ c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.10	0	5.5	discard	GPU LUT dequant ker
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.33	0	5.5	discard	GPU private buffer compression: blit shared→private before matvec. Isolated -13.5% but 4×7MB blit cost exceeds savings in pipeline.
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.91	0	5.5	discard	dispatch_io: -70% slower than pread (dispatch_data overhead kills it).
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.91	0	5.5	discard	Expert file clustering: NVMe doesn't care about scatter distance at 7MB read granularity. 0%.
-ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.17	0	5.5	keep	C/HIP gfx942 BASELINE: cold cache, 30 tokens, no VRAM cache (MI300X)
-ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	6.86	0	5.5	keep	C/HIP gfx942 BASELINE: warm cache, 30 tokens, no VRAM cache (MI300X)
-ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	6.91	0	5.5	keep	C/HIP gfx942 BASELINE: warm cache, 30 tokens, ENABLE_VRAM_CACHE=184320 (MI300X)
-ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	8.60	0	5.5	keep	C/HIP gfx942 BASELINE: warm cache, 100 tokens, ENABLE_VRAM_CACHE=184320 (MI300X)
+ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.91	0	5.5	keep	C/HIP gfx942 BASELINE: cold OS cache, 30 tokens, VRAM cache OFF (DISABLE_VRAM_CACHE=1) (MI300X)
+ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.32	0	5.5	keep	C/HIP gfx942 BASELINE: cold OS cache, 30 tokens, VRAM cache ~184GB (default, MI300X)
+ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.26	0	5.5	keep	C/HIP gfx942 BASELINE: warm OS cache, 30 tokens, VRAM cache OFF (DISABLE_VRAM_CACHE=1) (MI300X)
+ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	7.13	0	5.5	keep	C/HIP gfx942 BASELINE: warm OS cache, 30 tokens, VRAM cache ~184GB (default, MI300X)
+ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	8.99	0	5.5	keep	C/HIP gfx942 BASELINE: warm OS cache, 100 tokens, VRAM cache ~184GB (default, MI300X)
