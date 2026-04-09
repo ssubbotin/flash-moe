@@ -32,3 +32,8 @@ c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.10	0	5.5	discard	GPU LUT dequant ker
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.33	0	5.5	discard	GPU private buffer compression: blit shared→private before matvec. Isolated -13.5% but 4×7MB blit cost exceeds savings in pipeline.
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.91	0	5.5	discard	dispatch_io: -70% slower than pread (dispatch_data overhead kills it).
 c222a4f	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.91	0	5.5	discard	Expert file clustering: NVMe doesn't care about scatter distance at 7MB read granularity. 0%.
+12e6ca0	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.17	0	5.5	keep	C/HIP gfx1151 baseline: cold cache, 30 tokens, no VRAM cache (Strix Halo)
+12e6ca0	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.18	0	5.5	keep	C/HIP gfx1151 baseline: warm cache, 30 tokens, no VRAM cache (Strix Halo)
+12e6ca0	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.20	0	5.5	keep	C/HIP gfx1151 baseline: cold cache, 30 tokens, ENABLE_VRAM_CACHE=20480 (Strix Halo)
+12e6ca0	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.29	0	5.5	keep	C/HIP gfx1151 baseline: warm cache, 30 tokens, ENABLE_VRAM_CACHE=20480 (Strix Halo)
+12e6ca0	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.74	0	5.5	keep	C/HIP gfx1151 baseline: warm cache, 100 tokens, ENABLE_VRAM_CACHE=20480 (Strix Halo)
