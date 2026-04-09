@@ -1,0 +1,13 @@
+--- per-layer phase breakdown (last 10 tokens, averaged) ---
+phase        avg_ms_per_layer   x60_per_token
+attn                    2.120         127.20
+expert                  1.238          74.28
+oproj                   0.021           1.26
+combine                 0.010           0.60
+shared                  0.260          15.60
+io                      3.573         214.38
+route                   0.070           4.20
+norm                    0.020           1.20
+
+--- last 10 done lines ---
+[done] 19337.0 ms total, 644.6 ms/token, 1.55 tok/s
