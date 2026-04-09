@@ -749,15 +749,16 @@ __global__ void gated_delta_net_step(
     const float* __restrict__ g_decay, // [64]
     const float* __restrict__ beta_gate, // [64]
     float* __restrict__ output,        // [8192]
-    uint32_t k_heads_per_v             // = 4
+    uint32_t k_heads_per_v,            // = 4
+    uint32_t kh_mode                   // 0 = division (MLX), 1 = modulo (llama.cpp/GGUF)
 ) {
     uint32_t head_id = blockIdx.x;
     uint32_t vi = threadIdx.x;
-    // Key head mapping: modulo (matching llama.cpp iq1 = iv1 % neq1)
-    uint32_t num_k_heads = blockDim.x;  // HACK: pass via unused param
-    // Actually, num_k_heads = num_v_heads / k_heads_per_v
+    // Key head mapping is format-dependent:
+    //   MLX:        kh = head_id / k_heads_per_v  (chunked: V heads 0..3 share K head 0)
+    //   llama.cpp:  kh = head_id % num_k_heads    (interleaved: V heads 0,16,32,48 share K head 0)
     uint32_t n_kh = gridDim.x / k_heads_per_v;
-    uint32_t kh = head_id % n_kh;
+    uint32_t kh = (kh_mode == 0) ? (head_id / k_heads_per_v) : (head_id % n_kh);
     float g = g_decay[head_id];
     float beta = beta_gate[head_id];
 
