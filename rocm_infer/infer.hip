@@ -1701,14 +1701,18 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         }
 
         // GatedDeltaNet recurrence
+        // Key head mapping convention differs by format:
+        //   MLX (g_quant_format != 1): division — V heads 0..3 share K head 0
+        //   GGUF (g_quant_format == 1): modulo  — V heads 0,16,32,48 share K head 0 (matches llama.cpp)
         uint32_t khpv = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;
+        uint32_t kh_mode = (g_quant_format == 1) ? 1u : 0u;
         gated_delta_net_step<<<LINEAR_NUM_V_HEADS, 128>>>(
             model->delta_state[layer_idx],
             model->buf_conv_output,                           // q [2048] (scaled for GGUF)
             model->buf_conv_output + LINEAR_TOTAL_KEY,        // k [2048]
             model->buf_conv_output + 2 * LINEAR_TOTAL_KEY,    // v [8192]
             model->buf_g_decay, model->buf_beta_gate,
-            model->buf_delta_output, khpv);
+            model->buf_delta_output, khpv, kh_mode);
 
         if (layer_idx == 0 && g_dump_layer0) {
             float d5[5];
