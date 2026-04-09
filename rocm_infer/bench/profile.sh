@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Usage: ./profile.sh
-# Captures per-phase timing breakdown for apu_infer on gfx1151.
+# Captures per-phase timing breakdown for rocm_infer on MI300X (gfx942).
 #
-# Fedora 43 ROCm 6.4 does not ship rocprof, so this script uses the
-# in-engine --timing flag (per-layer phase timers) instead of
-# rocprofiler/rocprofv2 trace capture. Same goal: figure out where
-# time goes per token.
+# Ubuntu 24.04 ROCm 7.2 ships rocprof, but this script uses the in-engine
+# --timing flag (per-layer phase timers) instead of rocprofiler/rocprofv2
+# trace capture for simpler, reproducible phase attribution. Same goal:
+# figure out where time goes per token.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
