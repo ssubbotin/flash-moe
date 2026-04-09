@@ -929,7 +929,11 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
     CHECK_HIP(hipMalloc(&model->buf_shared_up, SHARED_INTERMEDIATE * sizeof(float)));
     CHECK_HIP(hipMalloc(&model->buf_shared_out, HIDDEN_DIM * sizeof(float)));
     CHECK_HIP(hipMalloc(&model->buf_expert_outs, MAX_K * HIDDEN_DIM * sizeof(float)));
-    CHECK_HIP(hipMalloc(&model->buf_expert_data, MAX_K * g_expert_size));
+    // buf_expert_data was a device-only staging area in the discrete-GPU port.
+    // On unified memory we point expert_ptrs[] straight at h_expert_buf[]
+    // (managed memory, see hipMallocManaged below), so this allocation is
+    // no longer needed. Keep the field NULL for any cache-eviction code path.
+    model->buf_expert_data = NULL;
 
     // Linear attention persistent state
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -975,9 +979,12 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
     CHECK_HIP(hipStreamCreate(&model->stream_compute));
     CHECK_HIP(hipStreamCreate(&model->stream_transfer));
 
-    // Expert staging (pinned host)
+    // Expert staging — managed memory on unified-memory APUs.
+    // pread() writes into it from the CPU, then the expert kernels read
+    // from the SAME buffer on the GPU with no intermediate hipMemcpy.
+    // hipMemAttachGlobal = visible from any device (CPU + device 0).
     for (int i = 0; i < K; i++)
-        CHECK_HIP(hipHostMalloc(&model->h_expert_buf[i], g_expert_size));
+        CHECK_HIP(hipMallocManaged(&model->h_expert_buf[i], g_expert_size, hipMemAttachGlobal));
 
     // Open expert files
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -1899,26 +1906,22 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                 }
 
                 if (slot >= 0) {
+                    // Populate the VRAM cache slot from managed host memory.
+                    // The kernel immediately reads from h_expert_buf[i] (managed,
+                    // UMA zero-copy) and in parallel we copy to the VRAM cache
+                    // slot for future cache-hit access.
                     void *dst = (char *)model->vram_cache_pool + (size_t)slot * g_expert_size;
-                    // Copy to temp buffer first (for immediate use), then async to cache
-                    void *tmp = (char *)model->buf_expert_data + k * g_expert_size;
-                    CHECK_HIP(hipMemcpy(tmp, model->h_expert_buf[i], g_expert_size,
-                                          hipMemcpyHostToDevice));
-                    // Async copy to cache slot (runs in background)
-                    CHECK_HIP(hipMemcpyAsync(dst, tmp, g_expert_size,
-                                               hipMemcpyDeviceToDevice, model->stream_transfer));
+                    CHECK_HIP(hipMemcpyAsync(dst, model->h_expert_buf[i], g_expert_size,
+                                               hipMemcpyHostToDevice, model->stream_transfer));
                     model->cache_slots[slot].layer = layer_idx;
                     model->cache_slots[slot].expert_id = eid;
                     model->cache_slots[slot].last_used = model->vram_cache_clock;
                     model->cache_slots[slot].access_count = 1;
                     model->cache_map[layer_idx][eid] = slot;
-                    expert_ptrs[k] = tmp;  // use temp buffer now, cache fills in background
+                    expert_ptrs[k] = model->h_expert_buf[i];  // kernel reads managed mem directly
                 } else {
-                    // No cache — use temporary buffer
-                    CHECK_HIP(hipMemcpy(
-                        (char *)model->buf_expert_data + k * g_expert_size,
-                        model->h_expert_buf[i], g_expert_size, hipMemcpyHostToDevice));
-                    expert_ptrs[k] = (char *)model->buf_expert_data + k * g_expert_size;
+                    // No VRAM cache — kernel reads managed host buffer directly.
+                    expert_ptrs[k] = model->h_expert_buf[i];
                 }
             }
         }
