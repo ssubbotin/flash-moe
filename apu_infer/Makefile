@@ -8,7 +8,7 @@ GPU_TARGETS ?= gfx1151
 # Has to be passed via -D so host code (kernel launch dims) and device code agree.
 WARP_SIZE ?= 32
 
-CFLAGS = -O2 --offload-arch=$(GPU_TARGETS) -DWARP_SIZE=$(WARP_SIZE)
+CFLAGS = -O3 -ffast-math --offload-arch=$(GPU_TARGETS) -DWARP_SIZE=$(WARP_SIZE)
 LDFLAGS = -lpthread
 
 # -fPIC for tokenizer_impl.o is required when linking through hipcc/lld on
