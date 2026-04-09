@@ -49,3 +49,4 @@ c9b04ba	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.00	0	5.5	discard	C/HIP gfx1151: dequ
 c9b04ba	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.00	0	5.5	discard	C/HIP gfx1151: LDS bank conflict audit — skipped, no rocprof/LDSBankConflict counter on Fedora 43 ROCm 6.4. Cannot measure without instrumentation
 c9b04ba	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.44	0	5.5	discard	C/HIP gfx1151: ROWS_PER_BLOCK=16 (larger LDS tiling) — slight regression from 3.50 to 3.44. 8 is already the sweet spot. 4 also slightly worse (3.42)
 c9b04ba	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.00	0	5.5	discard	C/HIP gfx1151: io_uring expert loader — skipped, expected saving ~0.7 ms/token (0.2% of budget) < 3% measurement noise floor
+c9b04ba	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.00	0	5.5	discard	C/HIP gfx1151: Huge pages for layer file mapping — N/A, depends on Task 1.3 (mmap) which was discarded because gfx1151/ROCm 6.4 cannot service GPU page faults on mmap'd regions
