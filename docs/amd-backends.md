@@ -23,7 +23,7 @@ Actual hardware validated in this work:
 |---|---|---|---|
 | `aeronav-llm` | RTX 4090 (24 GB) | CUDA 12.8 | Ubuntu |
 | `mi300` (DigitalOcean droplet) | MI300X VF, 192 GB VRAM | 7.2.0 | Ubuntu 24.04 |
-| `max395` | Radeon 8060S (Strix Halo, 32 CU, 32 GB VRAM) + 32 GB sys RAM | 6.4.2 | Fedora 43 |
+| `max395` | Radeon 8060S (Strix Halo, 40 CU / 20 WGP, 32 GB VRAM) + 32 GB sys RAM | 6.4.2 | Fedora 43 |
 
 ---
 
@@ -480,3 +480,74 @@ cf54a0b fix: gated_delta_net key head mapping is format-dependent (BREAKTHROUGH)
 All three branches live on `ssubbotin/flash-moe` only. `fork/cuda` is the
 head of PR #7 against `danveloper/flash-moe:main`. The other two are kept
 out of that PR.
+
+---
+
+## Part 4 — APU optimization: dp4a + hipMalloc (+78%)
+
+After the initial APU port reached 3.45 tok/s, two optimizations pushed it to
+**6.14 tok/s** (+78%). Both exploit AMD APU-specific features not used by any
+existing inference engine (llama.cpp, vLLM, Ollama, etc.).
+
+### Technique 1: dp4a int8 dot product kernel (+61%)
+
+**Problem:** The dequant matvec kernel (1005 calls/token, 76% of compute) was
+instruction-throughput limited despite 100% occupancy (39 VGPRs). Each packed
+uint32 of 8 nibbles required ~32 ALU instructions (8 FMAs + shifts + multiplies).
+The GPU couldn't issue enough memory loads because ALU was saturated.
+
+**Solution:** Pre-quantize the activation vector to int8 (Q8_1 format: per-32-element
+scale and sum). Use `__builtin_amdgcn_sudot4` (v_dot4_i32_iu8) for 4 int8×int8
+MACs per instruction. For our affine quantization format (scale+bias per 64 elements):
+
+```
+dot(W_row, x) ≈ w_scale * d_q8 * Σ(nibble_i × q8_i) + w_bias * d_q8 * Σ(q8_i)
+```
+
+The integer dot product `Σ(nibble_i × q8_i)` is computed via chained sudot4 calls.
+The activation quantization runs once before each batch of matvecs sharing the same
+input vector (~9 calls/layer, trivial overhead).
+
+**Key bug found:** The `warp_reduce_max` in the quantization kernel returned the
+correct max only in lane 0, but ALL lanes used it to compute the quantization scale.
+Without `__shfl(amax, 0)` to broadcast, 43% of q8 values were wrong.
+
+**Result:** Attention phase 2.12 → 0.58 ms/layer (3.7x), total 3.45 → 5.55 tok/s.
+
+### Technique 2: hipMalloc expert staging on APU (+9%)
+
+**Problem:** Expert buffers used `hipMallocManaged` (173 GB/s GPU read bandwidth).
+
+**Discovery:** On AMD APUs, CPU can `pread()` directly into `hipMalloc`'d buffers
+because CPU and GPU share the same physical LPDDR5X. `hipMalloc` gives 220 GB/s
+GPU read bandwidth (+27%) due to better TLB coverage (larger page table entries).
+This is not documented and doesn't work on discrete GPUs.
+
+**Verified experimentally:**
+- CPU memset to hipMalloc buffer → GPU reads correct data ✓
+- pread() to hipMalloc buffer → GPU reads correct data ✓
+- 220 GB/s GPU read vs 173 GB/s for hipMallocManaged ✓
+
+**Result:** Expert phase 0.93 → 0.42 ms/layer (2.2x), total 5.55 → 6.14 tok/s.
+
+### Discarded APU optimizations
+
+| Approach | Result | Why |
+|----------|--------|-----|
+| Nontemporal loads (`__builtin_nontemporal_load`) | 0% | Infinity Cache not the bottleneck |
+| XNACK (mmap direct GPU access) | N/A | Hardware absent from all RDNA silicon (retry circuit removed in RDNA 2) |
+| NPU expert offload (XDNA2) | N/A | Shared LPDDR5X bus = contention; 84µs/dispatch × 720 calls = 60ms overhead |
+| hipHostMallocNonCoherent | -27% vs hipMalloc | Worse TLB coverage despite GPU cacheability |
+| Software pipelining | Skipped | I/O (59%) is now the bottleneck, not kernel compute |
+
+### Final profile (dp4a + hipMalloc, warm 30 tokens)
+
+```
+phase        ms/layer   x60/token   %
+attn            0.61      36.6     22%
+expert          0.42      25.2     15%
+io              2.28     136.8     59% ← SSD/page cache bottleneck
+shared          0.08       4.8      3%
+route           0.03       1.8      1%
+total           ~2.72    163.0    6.14 tok/s
+```

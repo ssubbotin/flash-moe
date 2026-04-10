@@ -1,4 +1,26 @@
-# Kernel-level profile derivation (Task 3.1)
+# Kernel-level profile derivation
+
+## Post-dp4a profile (current, USE_DP4A=1 + hipMalloc expert staging)
+
+```
+phase     ms/layer   x60 tokens   % of 163 ms
+io           2.28     136.8        59%
+attn         0.61      36.6        22%
+expert       0.42      25.2        15%
+shared       0.08       4.8         3%
+route        0.03       1.8         1%
+oproj        0.03       1.8         1%
+norm         0.03       1.8         1%
+combine      0.01       0.6        <1%
+```
+
+Bottleneck shifted from attn (48% pre-dp4a) to I/O (59%). The dp4a kernel
+(sudot4 int8 dot product) reduced attn from 2.12 to 0.61 ms/layer (3.7x).
+hipMalloc expert staging reduced expert from 0.93 to 0.42 ms/layer (2.2x).
+
+---
+
+# Pre-dp4a kernel profile (historical, Task 3.1)
 
 Fedora 43 ROCm 6.4 ships no rocprof, so we derive kernel costs from the
 engine's `--timing` phase timers plus static analysis of each kernel's
