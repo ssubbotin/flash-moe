@@ -38,7 +38,7 @@
     urlcolor=blue!70!black
 }
 
-\title{Flash-MoE on NVIDIA: Three-Tier Expert Caching\\for 397B MoE Inference on Consumer GPUs}
+\title{Flash-MoE on Consumer GPUs: Three-Tier Expert Caching\\and dp4a Kernel Optimization for 397B MoE Inference}
 
 \author{\name Sergey Subbotin \email ssubbotin@gmail.com \\
       \addr Independent Researcher}
@@ -54,7 +54,9 @@ We port Flash-MoE (a system for running Qwen3.5-397B-A17B, 397 billion parameter
 
 Our key contribution is a \emph{three-tier expert caching hierarchy}: (1)~a frequency-weighted LRU cache in GPU VRAM ($\sim$17\,GB, $\sim$2500 experts), (2)~the OS page cache in system RAM ($\sim$50\,GB), and (3)~NVMe SSD for cold misses. After a brief warm-up period (3--8 requests), this hierarchy achieves $5.57 \pm 0.12$~tok/s steady-state ($n=15$) on an RTX~4090, starting from 2.20~tok/s cold, 28\% faster than the Apple Silicon version once the VRAM cache is warm, despite 2.5$\times$ slower SSD bandwidth. We also contribute a vec4 FMA-optimized CUDA dequantization kernel, multi-hardware benchmarks across three GPU generations (RTX~4090/3060/2080\,Ti), and a systematic analysis of seven optimization strategies, four of which proved counterproductive.
 
-The complete engine is two files ($\sim$2500 lines), supports OpenAI and Anthropic streaming APIs with tool calling, and requires only 16\,GB of system RAM.
+We further demonstrate cross-platform generalization by porting the engine to an AMD APU (Ryzen AI MAX+ 395, Strix Halo, 64\,GB unified LPDDR5X). On this unified-memory architecture, we replace the three-tier cache with a dp4a-optimized dequantization kernel (\texttt{v\_dot4\_i32\_iu8}, 8$\times$ fewer instructions per weight byte) and discover that \texttt{hipMalloc} provides 27\% higher GPU read bandwidth than \texttt{hipMallocManaged} on APUs because CPU can write directly to device memory through shared physical DRAM. These two techniques yield $6.14$~tok/s, 78\% above the unoptimized APU baseline and 41\% faster than the M3~Max, despite a 5$\times$ slower SSD.
+
+The complete engine is two source files per platform ($\sim$2500--4000 lines each), supports OpenAI and Anthropic streaming APIs with tool calling, and requires no framework dependencies.
 \end{abstract}
 
 % ============================================================================
@@ -468,6 +470,76 @@ Beyond raw inference speed, the engine provides:
 \paragraph{Multi-Turn Sessions.} KV caches and delta-net state persist across requests with the same \texttt{session\_id}. New sessions restore from a pre-computed system prompt snapshot ($\sim$4\,s prefill, instant restore).
 
 % ============================================================================
+\section{Cross-Platform: AMD APU (Strix Halo)}
+\label{sec:apu}
+
+To test the generality of the Flash-MoE approach beyond NVIDIA discrete GPUs, we port the engine to an AMD APU with unified memory---a fundamentally different architecture from both CUDA (discrete VRAM + PCIe) and Apple Silicon (unified memory + fast SSD DMA).
+
+\subsection{Hardware and Software}
+
+The test platform is an AMD Ryzen AI MAX+ 395 (Strix Halo): 16 Zen~5 CPU cores, 40 RDNA~3.5 compute units (gfx1151, wavefront-32), 64\,GB unified LPDDR5X at $\sim$215\,GB/s (shared across CPU, GPU, and NPU), and a Crucial T500 1\,TB NVMe SSD (3.4\,GB/s sequential read). The engine is compiled with ROCm~6.4 (\texttt{hipcc --offload-arch=gfx1151}).
+
+On this APU, the ``VRAM'' and system RAM are carved from the same physical LPDDR5X pool. There is no PCIe bus, no discrete memory hierarchy, and no benefit to a separate VRAM expert cache (copying between VRAM and system RAM is a memcpy within the same DRAM). The architecture is closer to Apple Silicon's unified memory than to NVIDIA's discrete model.
+
+\subsection{Baseline and Roofline Analysis}
+
+The unoptimized HIP port (FMA-based dequant matvec, \texttt{hipMallocManaged} expert buffers) achieves 3.45~tok/s. Each token reads $\sim$5.3\,GB of weight data. At the measured 215\,GB/s memory bandwidth, the roofline is 38.6~tok/s---we achieve only 9\%. Profiling reveals the bottleneck is \emph{instruction throughput}, not memory bandwidth: the FMA kernel requires $\sim$32 ALU instructions per 4~bytes of weight data (8~shift+mask, 16~float multiply, 8~FMA), saturating the ALU pipeline before the memory system is fully utilized.
+
+\subsection{dp4a Int8 Dot Product Kernel}
+
+RDNA~3/3.5 GPUs provide the \texttt{v\_dot4\_i32\_iu8} instruction (exposed as \texttt{\_\_builtin\_amdgcn\_sudot4}), which computes four int8$\times$int8 multiply-accumulates in a single cycle. We restructure the dequant matvec kernel as a two-pass operation:
+
+\paragraph{Pass 1: Activation quantization.} Convert the float32 input vector to int8 (Q8\_1 format: per-32-element scale and sum). This runs once before each batch of matvecs sharing the same input vector ($\sim$9 calls per layer, $< 0.1$\,ms/token total).
+
+\paragraph{Pass 2: Integer dot product.} For each packed uint32 of 8~weight nibbles, repack to sequential byte order and issue two \texttt{sudot4} calls:
+
+\begin{verbatim}
+  lo_nib = packed & 0xFFFF;
+  seq0 = spread_nibbles_to_bytes(lo_nib);
+  seq1 = spread_nibbles_to_bytes(packed >> 16);
+  idot = sudot4(seq0, q8_first4, idot);
+  idot = sudot4(seq1, q8_second4, idot);
+\end{verbatim}
+
+The float result is reconstructed per quantization group (64~elements spanning two Q8\_1 blocks): $\text{acc} \mathrel{+}= w_s \cdot (d_a \cdot \text{idot}_a + d_b \cdot \text{idot}_b) + w_b \cdot (d_a \cdot \Sigma_a + d_b \cdot \Sigma_b)$, where $w_s, w_b$ are the per-group weight scale and bias, $d_{a,b}$ are Q8\_1 block scales, and $\Sigma_{a,b}$ are precomputed sums for the bias correction term.
+
+This reduces the inner loop from $\sim$32 to $\sim$12 instructions per 8~nibbles. The attention phase drops from 2.12 to 0.58~ms/layer (3.7$\times$), yielding 5.55~tok/s (+61\%).
+
+\subsection{hipMalloc for Expert Staging on APU}
+
+On discrete GPUs, \texttt{hipMalloc} allocates device-only memory inaccessible to the CPU. On APUs, however, both CPU and GPU operate on the same physical DRAM. We experimentally verified that CPU \texttt{pread()} writes directly into \texttt{hipMalloc}'d buffers and the GPU reads the correct values---a technique that is undocumented and does not work on discrete GPUs.
+
+Microbenchmarking reveals that \texttt{hipMalloc} provides 220\,GB/s GPU read bandwidth versus 173\,GB/s for \texttt{hipMallocManaged} (+27\%), consistent with the MI300A findings of \citet{mi300a_upm} showing that \texttt{hipMalloc} achieves 1.6$\times$ the bandwidth of managed memory due to superior TLB coverage. On our APU, switching expert staging buffers from \texttt{hipMallocManaged} to \texttt{hipMalloc} reduces the expert phase from 0.93 to 0.42~ms/layer (2.2$\times$), yielding 6.14~tok/s (+78\% over baseline).
+
+\subsection{Negative Results on APU}
+
+\paragraph{XNACK (mmap direct GPU access).} We investigated whether the GPU could read directly from mmap'd file pages, enabling a ``trust the OS'' model like Apple Silicon. XNACK (GPU page fault retry) is physically absent from all RDNA silicon starting with RDNA~2---the retry circuit was removed from the Shader Sequencer. This is a hardware limitation, not a driver or firmware restriction.
+
+\paragraph{NPU expert offload.} The Strix Halo includes an XDNA2 NPU (50~TOPS INT8). We investigated offloading expert linear layers to the NPU. However, the NPU shares the same LPDDR5X bus as the GPU, so it cannot provide additional bandwidth for bandwidth-bound kernels. Furthermore, the NPU dispatch latency of $\sim$84\,$\mu$s per kernel call makes per-layer dispatch impractical: 720 expert matvecs $\times$ 84\,$\mu$s $=$ 60\,ms, equaling the entire expert compute budget.
+
+\paragraph{Nontemporal loads.} Adding \texttt{\_\_builtin\_nontemporal\_load} (SLC bit) to weight reads produced no measurable improvement, indicating that L2/Infinity Cache pollution is not a bottleneck in the current regime.
+
+\subsection{Cross-Platform Summary}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Flash-MoE performance across three platforms on Qwen3.5-397B-A17B (4-bit).}
+\label{tab:crossplatform}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Platform} & \textbf{GPU} & \textbf{RAM} & \textbf{SSD} & \textbf{tok/s} & \textbf{Key Technique} \\
+\midrule
+M3 Max (Metal) & 40-core GPU & 48\,GB & 17.5\,GB/s & 4.36 & FMA + trust OS \\
+RTX 4090 (CUDA) & SM128 & 24+64\,GB & 7\,GB/s & 5.57 & VRAM LRU cache \\
+AI MAX+ 395 (HIP) & 40 CU & 64\,GB & 3.4\,GB/s & \textbf{6.14} & dp4a + hipMalloc \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The AMD APU achieves the highest throughput despite the slowest SSD (3.4 vs.\ 17.5\,GB/s), because the dp4a kernel saturates a larger fraction of the available memory bandwidth. The remaining bottleneck is expert I/O (59\% of per-token time), suggesting that a faster NVMe or reduced BIOS VRAM allocation (freeing system RAM for the OS page cache) would yield further improvements.
+
+% ============================================================================
 \section{Discussion}
 
 \subsection{VRAM as the Dominant Factor}
@@ -476,13 +548,13 @@ Our multi-hardware benchmarks reveal that VRAM capacity matters more than SSD sp
 
 This suggests that future GPUs with larger VRAM (32--48\,GB) would provide disproportionate improvements for MoE inference, potentially caching 5000--7000 experts and pushing hit rates above 99\%.
 
-\subsection{Unified vs.\ Discrete: Complementary Strengths}
+\subsection{Three Memory Architectures, Three Strategies}
 
-Apple Silicon's unified memory provides higher streaming bandwidth (17.5\,GB/s) but no separate fast-memory tier. NVIDIA's discrete architecture provides a lower streaming bandwidth (7\,GB/s via PCIe) but offers VRAM as a 1008\,GB/s cache tier. For cold inference, Apple wins; for sustained generation, the VRAM cache advantage grows with each request.
+Each platform's optimal strategy is determined by its memory architecture. Apple Silicon's unified memory provides high streaming bandwidth (17.5\,GB/s) but no separate fast-memory tier---trust the OS page cache. NVIDIA's discrete architecture offers VRAM as a 1008\,GB/s cache tier, separated by a PCIe bottleneck---build a VRAM LRU cache. The AMD APU provides unified memory like Apple Silicon, but with RDNA's dp4a instruction and the ability to \texttt{pread()} into \texttt{hipMalloc}'d buffers---optimize for instruction throughput and TLB coverage. No single strategy dominates across platforms; the optimal approach is always hardware-specific.
 
 \subsection{Applicability}
 
-The three-tier caching approach generalizes to any MoE model where experts dominate total parameters. DeepSeek-V3~\citep{deepseekv3} (671B, 37B active) at 2-bit expert quantization would produce $\sim$200\,GB of expert data, within range of our streaming approach. The architecture-agnostic design (compile-time configuration via model manifest) has been validated on Qwen3.5-397B; adapting to Mixtral~\citep{mixtral} or other MoE models requires only re-running the weight extraction and repacking pipeline.
+The Flash-MoE approach generalizes along two axes. \emph{Model generality:} any MoE model where experts dominate total parameters. DeepSeek-V3~\citep{deepseekv3} (671B, 37B active) at 2-bit expert quantization would produce $\sim$200\,GB of expert data, within range of our streaming approach. The compile-time configuration via model manifest has been validated on Qwen3.5-397B. \emph{Hardware generality:} the same model runs on three fundamentally different architectures (Apple unified memory, NVIDIA discrete, AMD unified APU), each with a tailored optimization strategy but the same core streaming approach. The dp4a kernel technique from Section~\ref{sec:apu} is applicable to any RDNA~3+ GPU, including discrete cards (RX~7900~XTX, RX~9070).
 
 \subsection{Limitations}
 
@@ -496,7 +568,7 @@ This work enables running large Mixture-of-Experts language models on consumer-g
 % ============================================================================
 \section{Conclusion}
 
-We demonstrate that Mixture-of-Experts models exceeding 4$\times$ DRAM capacity can run at interactive speeds on commodity NVIDIA GPUs through a three-tier expert caching hierarchy. The key insight is that discrete GPU memory, while a liability for streaming, becomes an asset when used as a high-bandwidth expert cache. On RTX~4090, our system achieves $5.57 \pm 0.12$~tok/s sustained on Qwen3.5-397B-A17B, 28\% faster than the original Apple Silicon implementation, using only 16\,GB of system RAM. The complete engine is two source files totaling $\sim$2500 lines of CUDA/C, with no framework dependencies.
+We demonstrate that Mixture-of-Experts models exceeding 4$\times$ DRAM capacity can run at interactive speeds on commodity hardware through platform-specific optimization. On NVIDIA RTX~4090, a three-tier expert caching hierarchy achieves $5.57 \pm 0.12$~tok/s sustained on Qwen3.5-397B-A17B, 28\% faster than the original Apple Silicon implementation. On AMD APU (Ryzen AI MAX+ 395), a dp4a int8 dot product kernel combined with \texttt{hipMalloc} expert staging achieves 6.14~tok/s---the highest across all three platforms---despite a 5$\times$ slower SSD, by exploiting hardware integer dot products and an undocumented APU memory property. The optimal strategy differs by architecture: VRAM caching for discrete GPUs, instruction-throughput optimization for unified-memory APUs, SSD streaming for Apple Silicon. Each platform's engine is two source files ($\sim$2500--4000 lines) with no framework dependencies.
 
 % ============================================================================
 \bibliographystyle{tmlr}
