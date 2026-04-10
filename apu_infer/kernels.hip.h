@@ -77,6 +77,187 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 // ============================================================================
+// 0. Activation quantization: float32 → Q8_1 (int8 + per-block scale/sum)
+// ============================================================================
+// Q8_1 format: block_size=32 elements.
+//   q8[i] = round(x[i] / d), d = max_abs / 127
+//   sums[block] = sum(q8[i]) — precomputed for bias correction in affine quant
+// Run once before a batch of matvecs sharing the same input vector.
+
+#define Q8_BLOCK_SIZE 32
+
+__global__ void quantize_x_q8(
+    const float* __restrict__ x,
+    int8_t*      __restrict__ q8,
+    float*       __restrict__ q8_scales,
+    float*       __restrict__ q8_sums,
+    uint32_t dim
+) {
+    // One warp per Q8 block (32 elements = WARP_SIZE on RDNA)
+    uint32_t block_id = blockIdx.x * blockDim.y + threadIdx.y;
+    uint32_t lane = threadIdx.x;
+    uint32_t base = block_id * Q8_BLOCK_SIZE;
+    if (base >= dim) return;
+
+    uint32_t idx = base + lane;
+    float val = (idx < dim) ? x[idx] : 0.0f;
+
+    // Find max absolute value across the warp and broadcast to all lanes
+    float amax = warp_reduce_max(fabsf(val));
+    amax = __shfl(amax, 0);  // broadcast lane 0's result to all lanes
+
+    // Compute scale and quantize
+    float d = amax / 127.0f;
+    float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+    int q = __float2int_rn(val * inv_d);
+    q = max(-128, min(127, q));
+    int8_t q8_val = (int8_t)q;
+
+    // Store sequentially (no de-interleaving; the dp4a kernel repacks nibbles)
+    if (idx < dim) q8[idx] = q8_val;
+
+    // Compute sum of q8 values for bias correction (order doesn't matter)
+    float q_sum = warp_reduce_sum((float)q);
+
+    // Lane 0 writes scale and sum
+    if (lane == 0) {
+        q8_scales[block_id] = d;
+        q8_sums[block_id] = q_sum;
+    }
+}
+
+static inline void launch_quantize_x_q8(
+    const float* x, int8_t* q8, float* q8_scales, float* q8_sums,
+    uint32_t dim, hipStream_t stream = 0
+) {
+    uint32_t num_blocks = (dim + Q8_BLOCK_SIZE - 1) / Q8_BLOCK_SIZE;
+    // 4 warps per threadblock, each warp handles one Q8 block
+    uint32_t warps_per_tb = 4;
+    dim3 block(WARP_SIZE, warps_per_tb);
+    dim3 grid((num_blocks + warps_per_tb - 1) / warps_per_tb);
+    quantize_x_q8<<<grid, block, 0, stream>>>(x, q8, q8_scales, q8_sums, dim);
+}
+
+// ============================================================================
+// 0b. dp4a dequant matvec — sudot4 intrinsic (RDNA 3/3.5)
+// ============================================================================
+// Uses pre-quantized int8 activations (Q8_1 format) + uint4 weights.
+// Inner loop: 2 × sudot4 per packed uint32 (8 nibbles → 8 MACs in 2 instructions).
+//
+// Math for our affine quantization (scale + bias per group of 64):
+//   dot(W_row, x) = sum_g [ w_scale_g * sum_i(nibble_i * x_i) + w_bias_g * sum_i(x_i) ]
+// With Q8_1: x_i ≈ q8_i * d_x, sum(x_i) ≈ d_x * sum(q8_i)
+// So: dot ≈ sum_g [ w_scale_g * d_x * idot + w_bias_g * d_x * q8sum ]
+//   where idot = sum(nibble_i * q8_i) via sudot4
+
+#define DP4A_ROWS_PER_BLOCK 4
+
+__device__ __forceinline__ int sudot4_ui8(int a_u4x4, int b_i8x4, int c) {
+    return __builtin_amdgcn_sudot4(false, a_u4x4, true, b_i8x4, c, false);
+}
+
+__global__ void dequant_matvec_4bit_dp4a(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ biases,
+    const int8_t*   __restrict__ q8,
+    const float*    __restrict__ q8_scales,
+    const float*    __restrict__ q8_sums,
+    float*          __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * DP4A_ROWS_PER_BLOCK + warp_id;
+
+    if (row >= out_dim) return;
+
+    const uint32_t packed_cols = in_dim >> 3;          // in_dim / 8
+    const uint32_t num_groups = in_dim >> 6;           // in_dim / GROUP_SIZE(64)
+    const uint32_t packed_per_group = GROUP_SIZE >> 3;  // 64/8 = 8
+
+    const uint32_t* w_row = W_packed + row * packed_cols;
+    const uint16_t* s_row = scales + row * num_groups;
+    const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    // Process one group (64 elements = 8 packed uint32 = 2 Q8 blocks) at a time
+    // Each Q8 block = 32 elements with its own scale/sum
+    for (uint32_t g = lane; g < num_groups; g += WARP_SIZE) {
+        float w_scale = bf16_to_f32(s_row[g]);
+        float w_bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t col_base = g * packed_per_group;  // g * 8
+        uint32_t elem_base = g * GROUP_SIZE;       // g * 64
+
+        // Two Q8 blocks per group: block A (elements 0..31), block B (elements 32..63)
+        uint32_t q8_block_a = elem_base / Q8_BLOCK_SIZE;
+        uint32_t q8_block_b = q8_block_a + 1;
+        float d_a = q8_scales[q8_block_a];
+        float d_b = q8_scales[q8_block_b];
+        float sum_a = q8_sums[q8_block_a];
+        float sum_b = q8_sums[q8_block_b];
+
+        // Integer dot product for first 32 elements (4 packed uint32)
+        int idot_a = 0;
+        const int32_t* q8_row_a = (const int32_t*)(q8 + elem_base);
+        #pragma unroll
+        for (uint32_t p = 0; p < 4; p++) {
+            uint32_t packed = w_row[col_base + p];
+            // Repack nibbles to sequential bytes: {n0,n1,n2,n3} and {n4,n5,n6,n7}
+            // packed byte layout: byte[i] = (n[2i] | n[2i+1]<<4)
+            uint32_t lo_nib = packed & 0xFFFF;        // n0|(n1<<4)|(n2<<8)|(n3<<12)
+            uint32_t hi_nib = packed >> 16;            // n4|(n5<<4)|(n6<<8)|(n7<<12)
+            int seq0 = (int)((lo_nib & 0xF) | ((lo_nib & 0xF0) << 4) |
+                             ((lo_nib & 0xF00) << 8) | ((lo_nib & 0xF000) << 12));
+            int seq1 = (int)((hi_nib & 0xF) | ((hi_nib & 0xF0) << 4) |
+                             ((hi_nib & 0xF00) << 8) | ((hi_nib & 0xF000) << 12));
+
+            idot_a = sudot4_ui8(seq0, q8_row_a[p * 2 + 0], idot_a);
+            idot_a = sudot4_ui8(seq1, q8_row_a[p * 2 + 1], idot_a);
+        }
+
+        // Integer dot product for second 32 elements (4 packed uint32)
+        int idot_b = 0;
+        const int32_t* q8_row_b = (const int32_t*)(q8 + elem_base + 32);
+        #pragma unroll
+        for (uint32_t p = 0; p < 4; p++) {
+            uint32_t packed = w_row[col_base + 4 + p];
+            uint32_t lo_nib = packed & 0xFFFF;
+            uint32_t hi_nib = packed >> 16;
+            int seq0 = (int)((lo_nib & 0xF) | ((lo_nib & 0xF0) << 4) |
+                             ((lo_nib & 0xF00) << 8) | ((lo_nib & 0xF000) << 12));
+            int seq1 = (int)((hi_nib & 0xF) | ((hi_nib & 0xF0) << 4) |
+                             ((hi_nib & 0xF00) << 8) | ((hi_nib & 0xF000) << 12));
+
+            idot_b = sudot4_ui8(seq0, q8_row_b[p * 2 + 0], idot_b);
+            idot_b = sudot4_ui8(seq1, q8_row_b[p * 2 + 1], idot_b);
+        }
+
+        // Reconstruct float result: w_scale * (d_x * idot) + w_bias * (d_x * sum_q8)
+        acc += w_scale * (d_a * (float)idot_a + d_b * (float)idot_b)
+             + w_bias  * (d_a * sum_a + d_b * sum_b);
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+static inline void launch_dequant_matvec_dp4a(
+    const uint32_t* W, const uint16_t* scales, const uint16_t* biases,
+    const int8_t* q8, const float* q8_scales, const float* q8_sums,
+    float* out, uint32_t out_dim, uint32_t in_dim,
+    hipStream_t stream = 0
+) {
+    dim3 block(WARP_SIZE, DP4A_ROWS_PER_BLOCK);
+    dim3 grid((out_dim + DP4A_ROWS_PER_BLOCK - 1) / DP4A_ROWS_PER_BLOCK);
+    dequant_matvec_4bit_dp4a<<<grid, block, 0, stream>>>(
+        W, scales, biases, q8, q8_scales, q8_sums, out, out_dim, in_dim);
+}
+
+// ============================================================================
 // 1. 4-bit FMA dequant matvec
 // ============================================================================
 // blockDim = (WARP_SIZE, ROWS_PER_BLOCK), gridDim = ceil(out_dim / ROWS_PER_BLOCK)

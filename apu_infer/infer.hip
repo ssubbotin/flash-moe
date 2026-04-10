@@ -122,6 +122,13 @@ extern "C" {
 // Quant format (0 = MLX affine 4-bit, 1 = GGUF)
 static int g_quant_format = 0;  // set at startup from manifest
 
+// dp4a mode: use sudot4 int8 dot product kernel instead of FMA (env USE_DP4A=1)
+static int g_use_dp4a = 0;
+// Global q8 buffer pointers for dp4a (set during init, used by do_matvec)
+static int8_t *g_buf_q8 = NULL;
+static float  *g_buf_q8_scales = NULL;
+static float  *g_buf_q8_sums = NULL;
+
 // Runtime expert size — defaults to compile-time MLX value, overridden for GGUF
 static size_t g_expert_size = EXPERT_SIZE;
 
@@ -605,6 +612,11 @@ typedef struct {
     // Pre-allocated expert weights buffer (avoids per-layer hipMalloc)
     float *buf_expert_weights;  // [MAX_K] on GPU
 
+    // dp4a Q8_1 activation buffers (pre-quantized int8 for sudot4 kernel)
+    int8_t *buf_q8;             // [max_q8_dim] de-interleaved int8 activations
+    float  *buf_q8_scales;      // [max_q8_dim/32] per-block scale
+    float  *buf_q8_sums;        // [max_q8_dim/32] per-block sum of q8 values
+
     // HIP streams for I/O overlap
     hipStream_t stream_compute;
     hipStream_t stream_transfer;
@@ -975,6 +987,29 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
     // Pre-allocated expert weights buffer
     CHECK_HIP(hipMalloc(&model->buf_expert_weights, MAX_K * sizeof(float)));
 
+    // dp4a Q8_1 activation buffers — max dim across all matvec input vectors
+    {
+        const char *dp4a_env = getenv("USE_DP4A");
+        if (dp4a_env && atoi(dp4a_env)) g_use_dp4a = 1;
+
+        int max_q8_dim = HIDDEN_DIM;
+        if (SHARED_INTERMEDIATE > max_q8_dim) max_q8_dim = SHARED_INTERMEDIATE;
+        if (MOE_INTERMEDIATE > max_q8_dim) max_q8_dim = MOE_INTERMEDIATE;
+        // o_proj / out_proj input dim can be NUM_ATTN_HEADS*HEAD_DIM or LINEAR_TOTAL_VALUE
+        if (NUM_ATTN_HEADS * HEAD_DIM > max_q8_dim) max_q8_dim = NUM_ATTN_HEADS * HEAD_DIM;
+        if (LINEAR_TOTAL_VALUE > max_q8_dim) max_q8_dim = LINEAR_TOTAL_VALUE;
+        // Round up to Q8_BLOCK_SIZE (32) for alignment
+        max_q8_dim = (max_q8_dim + 31) & ~31;
+        CHECK_HIP(hipMalloc(&model->buf_q8, max_q8_dim * sizeof(int8_t)));
+        CHECK_HIP(hipMalloc(&model->buf_q8_scales, (max_q8_dim / 32) * sizeof(float)));
+        CHECK_HIP(hipMalloc(&model->buf_q8_sums, (max_q8_dim / 32) * sizeof(float)));
+        g_buf_q8 = model->buf_q8;
+        g_buf_q8_scales = model->buf_q8_scales;
+        g_buf_q8_sums = model->buf_q8_sums;
+        if (g_use_dp4a)
+            printf("[init] dp4a mode enabled (sudot4 int8 kernel)\n");
+    }
+
     // HIP streams for I/O overlap
     CHECK_HIP(hipStreamCreate(&model->stream_compute));
     CHECK_HIP(hipStreamCreate(&model->stream_transfer));
@@ -1293,9 +1328,24 @@ static inline void do_matvec(
 ) {
     if (g_quant_format == 1) {
         launch_dequant_matvec_gguf((const void *)W, x, out, out_dim, in_dim, gguf_type, stream);
+    } else if (g_use_dp4a) {
+        launch_quantize_x_q8(x, g_buf_q8, g_buf_q8_scales, g_buf_q8_sums, in_dim, stream);
+        launch_dequant_matvec_dp4a(W, S, B, g_buf_q8, g_buf_q8_scales, g_buf_q8_sums,
+                                   out, out_dim, in_dim, stream);
     } else {
         launch_dequant_matvec(W, S, B, x, out, out_dim, in_dim, stream);
     }
+}
+
+// dp4a-aware expert matvec: quantize input once, run gate/up with same q8, re-quantize for down
+static inline void do_expert_matvec_dp4a(
+    const uint32_t *W, const uint16_t *S, const uint16_t *B,
+    const float *x, float *out, uint32_t out_dim, uint32_t in_dim,
+    hipStream_t stream = 0
+) {
+    launch_quantize_x_q8(x, g_buf_q8, g_buf_q8_scales, g_buf_q8_sums, in_dim, stream);
+    launch_dequant_matvec_dp4a(W, S, B, g_buf_q8, g_buf_q8_scales, g_buf_q8_sums,
+                               out, out_dim, in_dim, stream);
 }
 
 static void expert_forward(Model *model, int expert_slot, int layer_idx, const float *input, float *output) {
@@ -1959,14 +2009,29 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
             uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-            launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
-                                  model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
-            launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
-                                  model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
-            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                          MOE_INTERMEDIATE);
-            launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
-                                  model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            if (g_use_dp4a) {
+                // dp4a path: quantize buf_normed once for gate+up (same input)
+                do_expert_matvec_dp4a(gate_w, gate_s, gate_b, model->buf_normed,
+                                      model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                // Reuse q8 from above (same input vector buf_normed)
+                launch_dequant_matvec_dp4a(up_w, up_s, up_b,
+                    g_buf_q8, g_buf_q8_scales, g_buf_q8_sums,
+                    model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                              MOE_INTERMEDIATE);
+                // down_proj: input is buf_shared_gate (after SwiGLU), need re-quantize
+                do_expert_matvec_dp4a(down_w, down_s, down_b, model->buf_shared_gate,
+                                      model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            } else {
+                launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
+                                      model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
+                                      model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                              MOE_INTERMEDIATE);
+                launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
+                                      model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            }
         }
     }
 
