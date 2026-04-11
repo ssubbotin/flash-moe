@@ -3348,6 +3348,26 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 }
 
 // ============================================================================
+// Reset model state for benchmark re-runs
+// ============================================================================
+
+static void model_reset_state(Model *model) {
+    int kv_size = MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (model->layers[i].is_full) {
+            CHECK_CUDA(cudaMemset(model->kv_k[i], 0, kv_size * sizeof(float)));
+            CHECK_CUDA(cudaMemset(model->kv_v[i], 0, kv_size * sizeof(float)));
+            model->kv_len[i] = 0;
+        } else {
+            CHECK_CUDA(cudaMemset(model->delta_state[i], 0,
+                LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float)));
+            CHECK_CUDA(cudaMemset(model->conv_state[i], 0,
+                (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float)));
+        }
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -3365,6 +3385,7 @@ int main(int argc, char **argv) {
     int max_tokens = 20;
     int K = 4;
     int timing = 0;
+    int bench_iters = 0;
 
     static struct option long_options[] = {
         {"weights",   required_argument, 0, 'w'},
@@ -3377,12 +3398,13 @@ int main(int argc, char **argv) {
         {"k",         required_argument, 0, 'k'},
         {"serve",     required_argument, 0, 'S'},
         {"timing",    no_argument,       0, 'M'},
+        {"bench",     required_argument, 0, 'B'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:Mh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:Mh", long_options, NULL)) != -1) {
         switch (c) {
             case 'w': weights_path = optarg; break;
             case 'j': manifest_path = optarg; break;
@@ -3394,6 +3416,7 @@ int main(int argc, char **argv) {
             case 'k': K = atoi(optarg); break;
             case 'S': serve_port = atoi(optarg); break;
             case 'M': timing = 1; g_timing_enabled = 1; break;
+            case 'B': bench_iters = atoi(optarg); break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
                 printf("  --weights PATH   model_weights.bin\n");
@@ -3406,6 +3429,7 @@ int main(int argc, char **argv) {
                 printf("  --k N            active experts (default: 4)\n");
                 printf("  --serve PORT     HTTP server (OpenAI-compatible API)\n");
                 printf("  --timing         per-layer timing\n");
+                printf("  --bench N        benchmark N tokens with correctness validation\n");
                 return 0;
             default: return 1;
         }
@@ -3573,6 +3597,9 @@ int main(int argc, char **argv) {
 
     if (!prompt_text) { fprintf(stderr, "Error: --prompt required\n"); return 1; }
 
+    // --bench N overrides --tokens
+    if (bench_iters > 0) max_tokens = bench_iters;
+
     // Tokenize prompt
     uint32_t token_ids_buf[4096];
     int num_tokens = bpe_encode(&tokenizer, prompt_text, token_ids_buf, 4096);
@@ -3582,38 +3609,113 @@ int main(int argc, char **argv) {
     if (num_tokens > 20) printf(" ...");
     printf("\n");
 
-    printf("\n[generating] %d tokens, K=%d experts\n", max_tokens, K);
-    double gen_start = now_ms();
+    int total_runs = (bench_iters > 0) ? 3 : 1;
+    int *ref_tokens = NULL;
+    int ref_count = 0;
+    double bench_toks[3];
 
-    // Process prompt tokens (prefill)
-    for (int i = 0; i < num_tokens; i++) {
-        double t0 = now_ms();
-        int next = forward(model, token_ids_buf[i], i, K);
-        double elapsed = now_ms() - t0;
-        if (timing) printf("[prefill %d/%d] token=%d, %.1f ms\n", i+1, num_tokens, token_ids_buf[i], elapsed);
-        if (i == num_tokens - 1) {
-            // Print first generated token
-            if (vocab_strings[next]) print_token(vocab_strings[next]);
-            fflush(stdout);
-            // Continue generating
-            int prev = next;
-            for (int t = 0; t < max_tokens - 1; t++) {
-                double tt0 = now_ms();
-                next = forward(model, prev, num_tokens + t, K);
-                double telapsed = now_ms() - tt0;
-                if (vocab_strings[next]) print_token(vocab_strings[next]);
-                fflush(stdout);
-                if (timing) printf(" [%.1fms]", telapsed);
-                prev = next;
-                // Stop on EOS
-                if (next == 151643 || next == 151645) break;  // <|endoftext|>, <|im_end|>
+    for (int run = 0; run < total_runs; run++) {
+        if (run > 0) model_reset_state(model);
+
+        if (bench_iters > 0) {
+            printf("\n[bench] === iteration %d/%d ===\n", run + 1, total_runs);
+        }
+
+        printf("\n[generating] %d tokens, K=%d experts\n", max_tokens, K);
+        double gen_start = now_ms();
+
+        // Collect generated token IDs for this run
+        int *gen_tokens = (int *)malloc(max_tokens * sizeof(int));
+        int gen_count = 0;
+
+        // Process prompt tokens (prefill)
+        for (int i = 0; i < num_tokens; i++) {
+            double t0 = now_ms();
+            int next = forward(model, token_ids_buf[i], i, K);
+            double elapsed = now_ms() - t0;
+            if (timing) printf("[prefill %d/%d] token=%d, %.1f ms\n", i+1, num_tokens, token_ids_buf[i], elapsed);
+            if (i == num_tokens - 1) {
+                // First generated token
+                gen_tokens[gen_count++] = next;
+                if (run == 0) {
+                    if (vocab_strings[next]) print_token(vocab_strings[next]);
+                    fflush(stdout);
+                }
+                // Continue generating
+                int prev = next;
+                for (int t = 0; t < max_tokens - 1; t++) {
+                    double tt0 = now_ms();
+                    next = forward(model, prev, num_tokens + t, K);
+                    double telapsed = now_ms() - tt0;
+                    gen_tokens[gen_count++] = next;
+                    if (run == 0) {
+                        if (vocab_strings[next]) print_token(vocab_strings[next]);
+                        fflush(stdout);
+                        if (timing) printf(" [%.1fms]", telapsed);
+                    }
+                    prev = next;
+                    // Stop on EOS
+                    if (next == 151643 || next == 151645) break;  // <|endoftext|>, <|im_end|>
+                }
             }
+        }
+
+        double gen_elapsed = now_ms() - gen_start;
+        double toks = gen_count / (gen_elapsed / 1000.0);
+
+        if (bench_iters > 0) {
+            if (run == 0) {
+                // Save reference
+                ref_tokens = gen_tokens;
+                ref_count = gen_count;
+                printf("\n\n[bench] iter %d: %.2f tok/s (reference, %d tokens)\n",
+                       run + 1, toks, gen_count);
+            } else {
+                // Compare against reference
+                int match = (gen_count == ref_count);
+                if (match) {
+                    for (int j = 0; j < gen_count; j++) {
+                        if (gen_tokens[j] != ref_tokens[j]) { match = 0; break; }
+                    }
+                }
+                printf("[bench] iter %d: %.2f tok/s [%s]\n",
+                       run + 1, toks, match ? "MATCH" : "MISMATCH");
+                if (!match) {
+                    // Show first divergence
+                    int min_n = gen_count < ref_count ? gen_count : ref_count;
+                    for (int j = 0; j < min_n; j++) {
+                        if (gen_tokens[j] != ref_tokens[j]) {
+                            printf("[bench]   first mismatch at token %d: ref=%d got=%d\n",
+                                   j, ref_tokens[j], gen_tokens[j]);
+                            break;
+                        }
+                    }
+                    if (gen_count != ref_count) {
+                        printf("[bench]   length mismatch: ref=%d got=%d\n",
+                               ref_count, gen_count);
+                    }
+                }
+                free(gen_tokens);
+            }
+            bench_toks[run] = toks;
+        } else {
+            printf("\n\n[done] %.1f ms total, %.1f ms/token, %.2f tok/s\n",
+                   gen_elapsed, gen_elapsed / max_tokens, toks);
+            free(gen_tokens);
         }
     }
 
-    double gen_elapsed = now_ms() - gen_start;
-    printf("\n\n[done] %.1f ms total, %.1f ms/token, %.2f tok/s\n",
-           gen_elapsed, gen_elapsed / max_tokens, max_tokens / (gen_elapsed / 1000.0));
+    if (bench_iters > 0) {
+        double sum = 0, mn = bench_toks[0], mx = bench_toks[0];
+        for (int i = 0; i < total_runs; i++) {
+            sum += bench_toks[i];
+            if (bench_toks[i] < mn) mn = bench_toks[i];
+            if (bench_toks[i] > mx) mx = bench_toks[i];
+        }
+        printf("[bench] avg: %.2f tok/s (min=%.2f max=%.2f)\n",
+               sum / total_runs, mn, mx);
+        free(ref_tokens);
+    }
 
     bpe_free(&tokenizer);
     return 0;
