@@ -2028,21 +2028,23 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
     if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.routing += t1-t0; t0=t1; }
 
-    // 5. Shared expert forward + expert I/O OVERLAP
+    // 5. Shared expert forward on stream_compute (overlaps with expert I/O)
     do_matvec(L.sg_w, L.sg_s, L.sg_b, model->buf_normed,
-              model->buf_shared_gate, SHARED_INTERMEDIATE, HIDDEN_DIM, L.qt_sg);
+              model->buf_shared_gate, SHARED_INTERMEDIATE, HIDDEN_DIM, L.qt_sg,
+              model->stream_compute);
     do_matvec(L.su_w, L.su_s, L.su_b, model->buf_normed,
-              model->buf_shared_up, SHARED_INTERMEDIATE, HIDDEN_DIM, L.qt_su);
+              model->buf_shared_up, SHARED_INTERMEDIATE, HIDDEN_DIM, L.qt_su,
+              model->stream_compute);
     launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                  SHARED_INTERMEDIATE);
+                  SHARED_INTERMEDIATE, model->stream_compute);
     do_matvec(L.sd_w, L.sd_s, L.sd_b, model->buf_shared_gate,
-              model->buf_shared_out, HIDDEN_DIM, SHARED_INTERMEDIATE, L.qt_sd);
-
-    // Shared expert gate score (can overlap with I/O)
+              model->buf_shared_out, HIDDEN_DIM, SHARED_INTERMEDIATE, L.qt_sd,
+              model->stream_compute);
     do_matvec(L.seg_w, L.seg_s, L.seg_b, model->buf_normed,
-              model->buf_gate_scores, 1, HIDDEN_DIM, L.qt_seg);
+              model->buf_gate_scores, 1, HIDDEN_DIM, L.qt_seg,
+              model->stream_compute);
 
-    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.shared_expert += t1-t0; t0=t1; }
+    if (g_timing_enabled) { CHECK_CUDA(cudaStreamSynchronize(model->stream_compute)); t1 = now_ms(); g_layer_timing.shared_expert += t1-t0; t0=t1; }
 
     // 6. Load K experts — check VRAM cache first, then SSD
     // expert_ptrs[k] points to expert data in VRAM (cache or freshly loaded)
@@ -2145,6 +2147,10 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     }
 
     if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.expert_io += t1-t0; t0=t1; }
+
+    // Sync shared expert stream — must complete before K expert forward
+    // (K experts reuse buf_shared_gate/buf_shared_up as scratch)
+    if (!g_timing_enabled) CHECK_CUDA(cudaStreamSynchronize(model->stream_compute));
 
     // 7. Expert forward (K experts on GPU, using cached pointers)
     for (int k = 0; k < K; k++) {
