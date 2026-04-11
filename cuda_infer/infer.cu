@@ -120,6 +120,12 @@ extern "C" {
 // Quant format (0 = MLX affine 4-bit, 1 = GGUF)
 static int g_quant_format = 0;  // set at startup from manifest
 
+// INT8 dp4a mode — enabled via --int8 flag (MLX format only)
+static int g_use_int8 = 0;
+
+// WMMA tensor core INT8 mode — enabled via --wmma flag (MLX format only)
+static int g_use_wmma = 0;
+
 // Runtime expert size — defaults to compile-time MLX value, overridden for GGUF
 static size_t g_expert_size = EXPERT_SIZE;
 
@@ -618,6 +624,11 @@ typedef struct {
     void *d_weights;  // single allocation for all non-expert weights
     size_t d_weights_size;
 
+    // INT8 dp4a buffers
+    int8_t *buf_q8;          // [max_in_dim] quantized activations
+    float  *buf_q8_scales;   // [max_in_dim / Q8_BLOCK_SIZE]
+    float  *buf_q8_sums;     // [max_in_dim / Q8_BLOCK_SIZE]
+
     // ---- VRAM expert cache ----
     // Frequency-weighted LRU cache of experts in GPU memory.
     // Eviction score = access_count * FREQ_WEIGHT + last_used.
@@ -637,6 +648,9 @@ typedef struct {
     } *cache_slots;
 
 } Model;
+
+// Global model pointer (for INT8 buffer access in do_matvec)
+static Model *g_model = NULL;
 
 // ============================================================================
 // Upload a tensor from mmap to GPU, return device pointer
@@ -932,6 +946,19 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
     CHECK_CUDA(cudaMalloc(&model->buf_shared_out, HIDDEN_DIM * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&model->buf_expert_outs, MAX_K * HIDDEN_DIM * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&model->buf_expert_data, MAX_K * g_expert_size));
+
+    // INT8 dp4a buffers — sized for max in_dim across all matvecs
+    {
+        uint32_t max_in = HIDDEN_DIM;
+        if (NUM_ATTN_HEADS * HEAD_DIM > (int)max_in) max_in = NUM_ATTN_HEADS * HEAD_DIM;
+        if (LINEAR_TOTAL_VALUE > (int)max_in) max_in = LINEAR_TOTAL_VALUE;
+        if (SHARED_INTERMEDIATE > (int)max_in) max_in = SHARED_INTERMEDIATE;
+        if (MOE_INTERMEDIATE > (int)max_in) max_in = MOE_INTERMEDIATE;
+        uint32_t q8_blocks = (max_in + Q8_BLOCK_SIZE - 1) / Q8_BLOCK_SIZE;
+        CHECK_CUDA(cudaMalloc(&model->buf_q8, max_in * sizeof(int8_t)));
+        CHECK_CUDA(cudaMalloc(&model->buf_q8_scales, q8_blocks * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&model->buf_q8_sums, q8_blocks * sizeof(float)));
+    }
 
     // Linear attention persistent state
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -1341,6 +1368,16 @@ static inline void do_matvec(
 ) {
     if (g_quant_format == 1) {
         launch_dequant_matvec_gguf((const void *)W, x, out, out_dim, in_dim, gguf_type, stream);
+    } else if (g_use_wmma) {
+        launch_quantize_x_q8(x, g_model->buf_q8, g_model->buf_q8_scales,
+                             g_model->buf_q8_sums, in_dim, stream);
+        launch_dequant_matvec_wmma(W, S, B, g_model->buf_q8, g_model->buf_q8_scales,
+                                   g_model->buf_q8_sums, out, out_dim, in_dim, stream);
+    } else if (g_use_int8) {
+        launch_quantize_x_q8(x, g_model->buf_q8, g_model->buf_q8_scales,
+                             g_model->buf_q8_sums, in_dim, stream);
+        launch_dequant_matvec_dp4a(W, S, B, g_model->buf_q8, g_model->buf_q8_scales,
+                                   g_model->buf_q8_sums, out, out_dim, in_dim, stream);
     } else {
         launch_dequant_matvec(W, S, B, x, out, out_dim, in_dim, stream);
     }
@@ -1374,18 +1411,54 @@ static void expert_forward(Model *model, int expert_slot, int layer_idx, const f
         uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
         uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-        // gate_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_gate
-        launch_dequant_matvec(gate_w, gate_s, gate_b, input, model->buf_shared_gate,
-                              MOE_INTERMEDIATE, HIDDEN_DIM);
-        // up_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_up
-        launch_dequant_matvec(up_w, up_s, up_b, input, model->buf_shared_up,
-                              MOE_INTERMEDIATE, HIDDEN_DIM);
-        // SwiGLU
-        launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                      MOE_INTERMEDIATE);
-        // down_proj: [HIDDEN_DIM, MOE_INTERMEDIATE] → output
-        launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate, output,
-                              HIDDEN_DIM, MOE_INTERMEDIATE);
+        if (g_use_wmma || g_use_int8) {
+            // Quantize input once for gate + up (both use HIDDEN_DIM input)
+            launch_quantize_x_q8(input, model->buf_q8, model->buf_q8_scales,
+                                 model->buf_q8_sums, HIDDEN_DIM);
+            if (g_use_wmma) {
+                launch_dequant_matvec_wmma(gate_w, gate_s, gate_b, model->buf_q8,
+                                           model->buf_q8_scales, model->buf_q8_sums,
+                                           model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_dequant_matvec_wmma(up_w, up_s, up_b, model->buf_q8,
+                                           model->buf_q8_scales, model->buf_q8_sums,
+                                           model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+            } else {
+                launch_dequant_matvec_dp4a(gate_w, gate_s, gate_b, model->buf_q8,
+                                           model->buf_q8_scales, model->buf_q8_sums,
+                                           model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_dequant_matvec_dp4a(up_w, up_s, up_b, model->buf_q8,
+                                           model->buf_q8_scales, model->buf_q8_sums,
+                                           model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+            }
+            // SwiGLU
+            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                          MOE_INTERMEDIATE);
+            // Quantize SwiGLU output for down_proj
+            launch_quantize_x_q8(model->buf_shared_gate, model->buf_q8, model->buf_q8_scales,
+                                 model->buf_q8_sums, MOE_INTERMEDIATE);
+            if (g_use_wmma) {
+                launch_dequant_matvec_wmma(down_w, down_s, down_b, model->buf_q8,
+                                           model->buf_q8_scales, model->buf_q8_sums,
+                                           output, HIDDEN_DIM, MOE_INTERMEDIATE);
+            } else {
+                launch_dequant_matvec_dp4a(down_w, down_s, down_b, model->buf_q8,
+                                           model->buf_q8_scales, model->buf_q8_sums,
+                                           output, HIDDEN_DIM, MOE_INTERMEDIATE);
+            }
+        } else {
+            // gate_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_gate
+            launch_dequant_matvec(gate_w, gate_s, gate_b, input, model->buf_shared_gate,
+                                  MOE_INTERMEDIATE, HIDDEN_DIM);
+            // up_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_up
+            launch_dequant_matvec(up_w, up_s, up_b, input, model->buf_shared_up,
+                                  MOE_INTERMEDIATE, HIDDEN_DIM);
+            // SwiGLU
+            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                          MOE_INTERMEDIATE);
+            // down_proj: [HIDDEN_DIM, MOE_INTERMEDIATE] → output
+            launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate, output,
+                                  HIDDEN_DIM, MOE_INTERMEDIATE);
+        }
     }
 }
 
@@ -2011,14 +2084,49 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
             uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-            launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
-                                  model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
-            launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
-                                  model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
-            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                          MOE_INTERMEDIATE);
-            launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
-                                  model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            if (g_use_wmma || g_use_int8) {
+                // Quantize input once for gate + up
+                launch_quantize_x_q8(model->buf_normed, model->buf_q8, model->buf_q8_scales,
+                                     model->buf_q8_sums, HIDDEN_DIM);
+                if (g_use_wmma) {
+                    launch_dequant_matvec_wmma(gate_w, gate_s, gate_b, model->buf_q8,
+                                               model->buf_q8_scales, model->buf_q8_sums,
+                                               model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                    launch_dequant_matvec_wmma(up_w, up_s, up_b, model->buf_q8,
+                                               model->buf_q8_scales, model->buf_q8_sums,
+                                               model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+                } else {
+                    launch_dequant_matvec_dp4a(gate_w, gate_s, gate_b, model->buf_q8,
+                                               model->buf_q8_scales, model->buf_q8_sums,
+                                               model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                    launch_dequant_matvec_dp4a(up_w, up_s, up_b, model->buf_q8,
+                                               model->buf_q8_scales, model->buf_q8_sums,
+                                               model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+                }
+                launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                              MOE_INTERMEDIATE);
+                // Quantize SwiGLU output for down_proj
+                launch_quantize_x_q8(model->buf_shared_gate, model->buf_q8, model->buf_q8_scales,
+                                     model->buf_q8_sums, MOE_INTERMEDIATE);
+                if (g_use_wmma) {
+                    launch_dequant_matvec_wmma(down_w, down_s, down_b, model->buf_q8,
+                                               model->buf_q8_scales, model->buf_q8_sums,
+                                               model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+                } else {
+                    launch_dequant_matvec_dp4a(down_w, down_s, down_b, model->buf_q8,
+                                               model->buf_q8_scales, model->buf_q8_sums,
+                                               model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+                }
+            } else {
+                launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
+                                      model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
+                                      model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                              MOE_INTERMEDIATE);
+                launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
+                                      model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            }
         }
     }
 
@@ -3399,12 +3507,14 @@ int main(int argc, char **argv) {
         {"serve",     required_argument, 0, 'S'},
         {"timing",    no_argument,       0, 'M'},
         {"bench",     required_argument, 0, 'B'},
+        {"int8",      no_argument,       0, 'I'},
+        {"wmma",      no_argument,       0, 'W'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:Mh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:IMWh", long_options, NULL)) != -1) {
         switch (c) {
             case 'w': weights_path = optarg; break;
             case 'j': manifest_path = optarg; break;
@@ -3417,6 +3527,8 @@ int main(int argc, char **argv) {
             case 'S': serve_port = atoi(optarg); break;
             case 'M': timing = 1; g_timing_enabled = 1; break;
             case 'B': bench_iters = atoi(optarg); break;
+            case 'I': g_use_int8 = 1; break;
+            case 'W': g_use_wmma = 1; break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
                 printf("  --weights PATH   model_weights.bin\n");
@@ -3430,6 +3542,8 @@ int main(int argc, char **argv) {
                 printf("  --serve PORT     HTTP server (OpenAI-compatible API)\n");
                 printf("  --timing         per-layer timing\n");
                 printf("  --bench N        benchmark N tokens with correctness validation\n");
+                printf("  --int8           use INT8 dp4a matvec kernel (MLX format only)\n");
+                printf("  --wmma           use WMMA tensor core INT8 matvec kernel (MLX format only)\n");
                 return 0;
             default: return 1;
         }
@@ -3588,6 +3702,25 @@ int main(int argc, char **argv) {
     // Initialize model
     Model *model = model_init(wf, expert_dir, K);
     if (!model) return 1;
+    g_model = model;
+
+    if (g_use_wmma) {
+        if (g_quant_format == 1) {
+            fprintf(stderr, "[warn] --wmma not supported with GGUF format, ignoring\n");
+            g_use_wmma = 0;
+        } else {
+            printf("[init] WMMA tensor core INT8 matvec enabled\n");
+            g_use_int8 = 0;  // WMMA takes precedence over dp4a
+        }
+    }
+    if (g_use_int8) {
+        if (g_quant_format == 1) {
+            fprintf(stderr, "[warn] --int8 not supported with GGUF format, ignoring\n");
+            g_use_int8 = 0;
+        } else {
+            printf("[init] INT8 dp4a matvec enabled\n");
+        }
+    }
 
     // Serve mode
     if (serve_port > 0) {
