@@ -611,8 +611,9 @@ typedef struct {
     // Expert I/O staging (pinned host)
     void *h_expert_buf[MAX_K];
 
-    // Pre-allocated expert weights buffer (avoids per-layer cudaMalloc)
+    // Pre-allocated expert routing buffers (avoids per-layer cudaMalloc)
     float *buf_expert_weights;  // [MAX_K] on GPU
+    int   *buf_expert_ids;      // [MAX_K] on GPU
 
     // GDS handles (NULL if GDS not available)
     int gds_available;
@@ -1033,8 +1034,9 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
     CHECK_CUDA(cudaMalloc(&model->buf_logits, VOCAB_SIZE * sizeof(float)));
     CHECK_CUDA(cudaMallocHost(&model->h_logits, VOCAB_SIZE * sizeof(float)));
 
-    // Pre-allocated expert weights buffer
+    // Pre-allocated expert routing buffers
     CHECK_CUDA(cudaMalloc(&model->buf_expert_weights, MAX_K * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&model->buf_expert_ids, MAX_K * sizeof(int)));
 
     // CUDA streams for I/O overlap
     CHECK_CUDA(cudaStreamCreate(&model->stream_compute));
@@ -2008,18 +2010,17 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.oproj_residual += t1-t0; t0=t1; }
 
-    // 4. MoE routing
+    // 4. MoE routing (GPU-side softmax + topK — no sync between gate matvec and routing)
     do_matvec(L.gate_w, L.gate_s, L.gate_b, model->buf_normed,
               model->buf_gate_scores, NUM_EXPERTS, HIDDEN_DIM, L.qt_gate);
+    launch_gpu_softmax_topk(model->buf_gate_scores, model->buf_expert_ids,
+                            model->buf_expert_weights, NUM_EXPERTS, K);
     CHECK_CUDA(cudaDeviceSynchronize());
-
-    float h_scores[NUM_EXPERTS];
-    CHECK_CUDA(cudaMemcpy(h_scores, model->buf_gate_scores, NUM_EXPERTS * sizeof(float), cudaMemcpyDeviceToHost));
-    cpu_softmax(h_scores, NUM_EXPERTS);
 
     int expert_ids[MAX_K];
     float expert_weights[MAX_K];
-    topk(h_scores, NUM_EXPERTS, K, expert_ids, expert_weights);
+    CHECK_CUDA(cudaMemcpy(expert_ids, model->buf_expert_ids, K * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(expert_weights, model->buf_expert_weights, K * sizeof(float), cudaMemcpyDeviceToHost));
 
     if (g_expert_log)
         fprintf(g_expert_log, "%d %d %d %d %d\n", layer_idx,
@@ -2231,11 +2232,9 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     }
 
     // 8. MoE combine + residual (no per-layer malloc)
+    // expert_weights already in buf_expert_weights from gpu_softmax_topk kernel
     float h_seg_score;
     CHECK_CUDA(cudaMemcpy(&h_seg_score, model->buf_gate_scores, sizeof(float), cudaMemcpyDeviceToHost));
-
-    CHECK_CUDA(cudaMemcpy(model->buf_expert_weights, expert_weights,
-                          K * sizeof(float), cudaMemcpyHostToDevice));
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.expert_compute += t1-t0; t0=t1; }
 

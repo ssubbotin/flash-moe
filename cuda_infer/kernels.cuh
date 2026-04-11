@@ -23,6 +23,7 @@
  *  13. compute_decay_beta       — GatedDeltaNet decay and beta gate
  *  14. gated_rms_norm           — RMS norm with SiLU gate and bf16 weights
  *  15. moe_combine_residual     — Weighted expert sum + shared expert + residual
+ *  16. gpu_softmax_topk         — GPU-side softmax + topK for MoE routing
  */
 
 #pragma once
@@ -1742,4 +1743,146 @@ static inline void launch_cublas_int32_to_float(
 ) {
     cublas_int32_to_float<<<(n + 255) / 256, 256, 0, stream>>>(
         C, row_scales, x_scale_ptr, out, n);
+}
+
+// 16. GPU-side softmax + topK for MoE routing
+//
+// Single-block kernel: loads gate scores, computes numerically-stable softmax,
+// then finds top-K indices via K passes of argmax.
+// Launch with 1 block of BLOCK_SIZE threads, shared memory = num_experts * sizeof(float).
+__global__ void gpu_softmax_topk(
+    const float* __restrict__ scores,   // [num_experts]
+    int*   __restrict__ out_indices,     // [k]
+    float* __restrict__ out_weights,     // [k]
+    int num_experts,
+    int k
+) {
+    extern __shared__ float smem[];  // [num_experts]
+
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    // Step 1: Load scores into shared memory
+    for (int i = tid; i < num_experts; i += nthreads)
+        smem[i] = scores[i];
+    __syncthreads();
+
+    // Step 2: Find max for numerical stability (warp-aware block reduce)
+    float local_max = -1e30f;
+    for (int i = tid; i < num_experts; i += nthreads)
+        local_max = fmaxf(local_max, smem[i]);
+
+    // Warp reduce max
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+
+    // Block reduce: use first element of each warp
+    __shared__ float warp_max[32];  // max 32 warps in a block
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) warp_max[warp_id] = local_max;
+    __syncthreads();
+
+    float block_max;
+    if (tid == 0) {
+        block_max = warp_max[0];
+        int num_warps = (nthreads + 31) / 32;
+        for (int w = 1; w < num_warps; w++)
+            block_max = fmaxf(block_max, warp_max[w]);
+        warp_max[0] = block_max;
+    }
+    __syncthreads();
+    block_max = warp_max[0];
+
+    // Step 3: Compute exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < num_experts; i += nthreads) {
+        float e = expf(smem[i] - block_max);
+        smem[i] = e;
+        local_sum += e;
+    }
+    __syncthreads();
+
+    // Warp reduce sum
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+
+    __shared__ float warp_sum[32];
+    if (lane_id == 0) warp_sum[warp_id] = local_sum;
+    __syncthreads();
+
+    float block_sum;
+    if (tid == 0) {
+        block_sum = warp_sum[0];
+        int num_warps = (nthreads + 31) / 32;
+        for (int w = 1; w < num_warps; w++)
+            block_sum += warp_sum[w];
+        warp_sum[0] = block_sum;
+    }
+    __syncthreads();
+    block_sum = warp_sum[0];
+
+    // Step 4: Normalize (softmax)
+    float inv_sum = 1.0f / block_sum;
+    for (int i = tid; i < num_experts; i += nthreads)
+        smem[i] *= inv_sum;
+    __syncthreads();
+
+    // Step 5: K passes of argmax to find top-K
+    // Only thread 0 writes results; all threads participate in reduction
+    for (int pass = 0; pass < k; pass++) {
+        // Each thread finds its local best
+        float local_best_val = -1e30f;
+        int local_best_idx = -1;
+        for (int i = tid; i < num_experts; i += nthreads) {
+            if (smem[i] > local_best_val) {
+                local_best_val = smem[i];
+                local_best_idx = i;
+            }
+        }
+
+        // Warp reduce argmax: carry both value and index
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_val = __shfl_down_sync(0xffffffff, local_best_val, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, local_best_idx, offset);
+            if (other_val > local_best_val) {
+                local_best_val = other_val;
+                local_best_idx = other_idx;
+            }
+        }
+
+        // Block reduce via shared memory
+        __shared__ float warp_best_val[32];
+        __shared__ int warp_best_idx[32];
+        if (lane_id == 0) {
+            warp_best_val[warp_id] = local_best_val;
+            warp_best_idx[warp_id] = local_best_idx;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float best_val = warp_best_val[0];
+            int best_idx = warp_best_idx[0];
+            int num_warps = (nthreads + 31) / 32;
+            for (int w = 1; w < num_warps; w++) {
+                if (warp_best_val[w] > best_val) {
+                    best_val = warp_best_val[w];
+                    best_idx = warp_best_idx[w];
+                }
+            }
+            out_indices[pass] = best_idx;
+            out_weights[pass] = best_val;
+            // Mark this expert as used
+            if (best_idx >= 0) smem[best_idx] = -1e30f;
+        }
+        __syncthreads();
+    }
+}
+
+static inline void launch_gpu_softmax_topk(
+    const float* scores, int* out_indices, float* out_weights,
+    int num_experts, int k, cudaStream_t stream = 0
+) {
+    gpu_softmax_topk<<<1, 256, num_experts * sizeof(float), stream>>>(
+        scores, out_indices, out_weights, num_experts, k);
 }
