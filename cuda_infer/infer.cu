@@ -2660,8 +2660,8 @@ static char *build_chat_prompt(const char *body, const char *tools_json) {
         }
     }
 
-    // End with assistant prompt
-    w += sprintf(w, "<|im_start|>assistant\n");
+    // End with assistant prompt + thinking mode
+    w += sprintf(w, "<|im_start|>assistant\n<think>\n");
     return prompt;
 }
 
@@ -3000,7 +3000,7 @@ static char *build_anthropic_prompt(const char *body, const char *system_prompt)
         }
     }
 
-    w += sprintf(w, "<|im_start|>assistant\n");
+    w += sprintf(w, "<|im_start|>assistant\n<think>\n");
     return prompt;
 }
 
@@ -3070,7 +3070,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 
     fprintf(stderr, "[serve] System prompt: %d tokens, prefilling...\n", sys_ntokens);
     double t_prefill = now_ms();
-    for (int i = 0; i < sys_ntokens; i++)
+    for (int i = 0; i < 0; i++) // DISABLED
         forward(model, sys_ids[i], i, K);
     int sys_pos = sys_ntokens;
     fprintf(stderr, "[serve] System prompt cached in %.0f ms\n", now_ms() - t_prefill);
@@ -3209,7 +3209,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos); for(int i=0;i<turn_ntokens&&i<10;i++) fprintf(stderr,"  token[%d]=%u\n",i,turn_ids[i]);
+            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos);
 
             // Send SSE headers
             http_write_str(client_fd, SSE_HEADERS);
@@ -3229,36 +3229,39 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int gen_buf_len = 0;
             int in_tool_call = 0;
             int tool_call_count = 0;
-
-            // Special token IDs to suppress from output
-            // These are Qwen3.5 special token IDs that should not appear as content
-            int suppress_tokens[] = {
-                EOS_TOKEN_1,  // <|endoftext|>
-                IM_START,     // <|im_start|>
-                EOS_TOKEN_2,  // <|im_end|>
-            };
-            int n_suppress = sizeof(suppress_tokens) / sizeof(suppress_tokens[0]);
+            int in_thinking = 1;  // Start in thinking mode (prompt ends with <think>\n)
 
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
-                // Stop on EOS tokens
-                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
-
-                // Check if this is a suppressed special token
-                int is_special = 0;
-                for (int s = 0; s < n_suppress; s++) {
-                    if (next_token == suppress_tokens[s]) { is_special = 1; break; }
-                }
-                if (is_special) {
-                    // Special token — don't output, just continue generating
-                    gen_count++;
-                    next_token = forward(model, next_token, pos++, K);
-                    continue;
+                // Stop on EOS tokens (only after thinking is done)
+                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
+                    if (in_thinking) {
+                        // Model ended turn during thinking without </think>.
+                        // Treat as end of thinking and continue — model may
+                        // produce response after the <|im_end|>.
+                        in_thinking = 0;
+                    }
+                    break;
                 }
 
                 // Decode token
                 char decoded[1024] = {};
                 if (vocab_strings[next_token])
                     bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
+
+                // Check for end of thinking
+                if (in_thinking && next_token == 248069) {  // </think>
+                    in_thinking = 0;
+                    gen_count++;
+                    next_token = forward(model, next_token, pos++, K);
+                    continue;
+                }
+
+                // Suppress thinking content
+                if (in_thinking) {
+                    gen_count++;
+                    next_token = forward(model, next_token, pos++, K);
+                    continue;
+                }
 
                 // Accumulate in buffer for tool call detection
                 if (gen_buf_len + (int)strlen(decoded) < (int)sizeof(gen_buffer) - 1) {
@@ -3269,23 +3272,17 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 // Check for tool call start
                 if (!in_tool_call && strstr(gen_buffer, "<tool_call>")) {
                     in_tool_call = 1;
-                    // Flush any content before <tool_call> that was already sent
-                    // (the "<tool_call>" text itself was accumulated but not sent)
                 }
 
                 // Stop if decoded text contains EOS markers
                 if (strstr(decoded, "<|im_end|>") || strstr(decoded, "<|endoftext|>")) break;
 
-                // Filter special text patterns from content
+                // Filter special tokens from content
                 int is_filtered = (
-                    strstr(decoded, "<|im_start|>") ||
-                    strstr(decoded, "<|im_end|>") ||
-                    strstr(decoded, "<|endoftext|>") ||
+                    next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2 ||
+                    next_token == IM_START ||
                     strcmp(decoded, "<think>") == 0 ||
-                    strcmp(decoded, "</think>") == 0 ||
-                    strcmp(decoded, "user") == 0 ||     // stray role tokens
-                    strcmp(decoded, "assistant") == 0 || // stray role tokens
-                    strcmp(decoded, "system") == 0       // stray role tokens
+                    strcmp(decoded, "</think>") == 0
                 );
 
                 // If not in a tool call and not filtered, stream content
@@ -3406,7 +3403,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos); for(int i=0;i<turn_ntokens&&i<10;i++) fprintf(stderr,"  token[%d]=%u\n",i,turn_ids[i]);
+            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos);
 
             // Send SSE headers
             static const char *ANTH_SSE_HEADERS =
@@ -3439,26 +3436,29 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int tool_call_count = 0;
             const char *stop_reason = "end_turn";
 
-            // Special tokens to suppress
-            int suppress_tokens[] = { 151643, 151644, 151645, 151646, 151647, 151648,
-                                      151649, 151650, 151651, 151652, 151653, 151654 };
-            int n_suppress = sizeof(suppress_tokens) / sizeof(suppress_tokens[0]);
+            int in_thinking = 1;  // Start in thinking mode (prompt ends with <think>\n)
 
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
 
-                int is_special = 0;
-                for (int s = 0; s < n_suppress; s++)
-                    if (next_token == suppress_tokens[s]) { is_special = 1; break; }
-                if (is_special) {
+                char decoded[1024] = {};
+                if (vocab_strings[next_token])
+                    bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
+
+                // Check for end of thinking
+                if (in_thinking && next_token == 248069) {  // </think>
+                    in_thinking = 0;
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
                 }
 
-                char decoded[1024] = {};
-                if (vocab_strings[next_token])
-                    bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
+                // Suppress thinking content
+                if (in_thinking) {
+                    gen_count++;
+                    next_token = forward(model, next_token, pos++, K);
+                    continue;
+                }
 
                 if (strstr(decoded, "<|im_end|>") || strstr(decoded, "<|endoftext|>")) break;
 
@@ -3471,14 +3471,12 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 if (!in_tool_call && strstr(gen_buffer, "<tool_call>"))
                     in_tool_call = 1;
 
-                // Stream text content
+                // Stream text content (filter special tokens)
                 if (!in_tool_call && decoded[0]) {
                     int is_filtered = (
-                        strstr(decoded, "<|im_start|>") || strstr(decoded, "<|im_end|>") ||
-                        strstr(decoded, "<|endoftext|>") ||
-                        strcmp(decoded, "<think>") == 0 || strcmp(decoded, "</think>") == 0 ||
-                        strcmp(decoded, "user") == 0 || strcmp(decoded, "assistant") == 0 ||
-                        strcmp(decoded, "system") == 0
+                        next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2 ||
+                        next_token == IM_START ||
+                        strcmp(decoded, "<think>") == 0 || strcmp(decoded, "</think>") == 0
                     );
                     if (!is_filtered) {
                         if (anth_send_text_delta(client_fd, block_index, decoded) < 0) {
@@ -3593,12 +3591,14 @@ int main(int argc, char **argv) {
         {"int8",      no_argument,       0, 'I'},
         {"wmma",      no_argument,       0, 'W'},
         {"cublas",    no_argument,       0, 'C'},
+        {"prompt-file", required_argument, 0, 'F'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
+    const char *prompt_file = NULL;
     int c;
-    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:IMWCh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:F:IMWCh", long_options, NULL)) != -1) {
         switch (c) {
             case 'w': weights_path = optarg; break;
             case 'j': manifest_path = optarg; break;
@@ -3614,6 +3614,7 @@ int main(int argc, char **argv) {
             case 'I': g_use_int8 = 1; break;
             case 'W': g_use_wmma = 1; break;
             case 'C': g_use_cublas = 1; break;
+            case 'F': prompt_file = optarg; break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
                 printf("  --weights PATH   model_weights.bin\n");
@@ -3635,8 +3636,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!prompt_text && serve_port == 0) {
-        fprintf(stderr, "Error: --prompt or --serve required\n");
+    if (!prompt_text && !prompt_file && serve_port == 0) {
+        fprintf(stderr, "Error: --prompt, --prompt-file, or --serve required\n");
         return 1;
     }
     // Initialize CUDA
@@ -3833,7 +3834,17 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!prompt_text) { fprintf(stderr, "Error: --prompt required\n"); return 1; }
+    if (prompt_file) {
+        FILE *pf = fopen(prompt_file, "r");
+        if (!pf) { fprintf(stderr, "Error: cannot open %s\n", prompt_file); return 1; }
+        fseek(pf, 0, SEEK_END); long psz = ftell(pf); fseek(pf, 0, SEEK_SET);
+        char *pbuf = (char *)malloc(psz + 1);
+        pbuf[fread(pbuf, 1, psz, pf)] = 0;
+        fclose(pf);
+        prompt_text = pbuf;
+        fprintf(stderr, "[prompt-file] Read %ld bytes from %s\n", psz, prompt_file);
+    }
+    if (!prompt_text) { fprintf(stderr, "Error: --prompt or --prompt-file required\n"); return 1; }
 
     // --bench N overrides --tokens
     if (bench_iters > 0) max_tokens = bench_iters;
@@ -3893,7 +3904,7 @@ int main(int argc, char **argv) {
                     }
                     prev = next;
                     // Stop on EOS
-                    if (next == 151643 || next == 151645) break;  // <|endoftext|>, <|im_end|>
+                    if (next == EOS_TOKEN_1 || next == EOS_TOKEN_2) break;
                 }
             }
         }

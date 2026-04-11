@@ -5851,10 +5851,10 @@ static const char *CORS_RESPONSE =
     "\r\n";
 
 // Tokenize a user turn (system prompt already cached in KV).
-// Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+// Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n<think>\n
 static PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
@@ -5872,7 +5872,7 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     // EOS/<|im_end|> is already in the state (fed through model at end of generation)
     // Just need the newline + new user turn + assistant prompt
     const char *prefix = "\n<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
@@ -5902,7 +5902,7 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant. /think");
+    return strdup("You are a helpful assistant.");
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
@@ -5910,13 +5910,13 @@ static PromptTokens *tokenize_chat_message(const char *user_content) {
     static char *sys_prompt_text = NULL;
     if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
 
-    // Build: <|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+    // Build: <|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n<think>\n
     size_t sys_len = strlen(sys_prompt_text);
     size_t user_len = strlen(user_content);
-    size_t total = 30 + sys_len + 30 + user_len + 40;  // generous padding for tags
+    size_t total = 30 + sys_len + 30 + user_len + 50;  // generous padding for tags
     char *prompt = malloc(total);
     if (!prompt) return NULL;
-    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n",
              sys_prompt_text, user_content);
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
@@ -6377,7 +6377,7 @@ static void serve_loop(
             }
             double t_gen = now_ms();
             int gen_count = 0;
-            int in_think = 0;
+            int in_think = 1;  // Start in thinking mode (prompt ends with <think>\n)
             int think_tokens = 0;
             // Accumulate response for session persistence
             char *gen_response = calloc(1, 256 * 1024);
@@ -6420,6 +6420,27 @@ static void serve_loop(
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
+                }
+                // Only stream non-thinking content to client
+                if (in_think) {
+                    // Suppress thinking tokens — just generate next
+                    gen_count++;
+                    cache_telemetry_note_token();
+                    embed_lookup(wf, next_token, hidden);
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+                    lm_head_forward(wf, hidden, logits);
+                    next_token = cpu_argmax(logits, VOCAB_SIZE);
+                    continue;
                 }
                 if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
                     fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
