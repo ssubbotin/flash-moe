@@ -3004,6 +3004,7 @@ static char *build_anthropic_prompt(const char *body, const char *system_prompt)
     return prompt;
 }
 
+static void model_reset_state(Model *model);
 static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokenizer,
                        int port, int K) {
     signal(SIGPIPE, SIG_IGN);
@@ -3065,7 +3066,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 
     uint32_t sys_ids[4096];
     int sys_ntokens = bpe_encode(tokenizer, sys_chatml, sys_ids, 4096);
-    free(sys_chatml);
+    // sys_chatml kept alive for per-request re-prefill
 
     fprintf(stderr, "[serve] System prompt: %d tokens, prefilling...\n", sys_ntokens);
     double t_prefill = now_ms();
@@ -3185,51 +3186,35 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                     is_continuation ? " [CONTINUE]" : " [NEW]");
 
             int pos;
-            if (is_continuation) {
-                // Continue from existing state — no restore needed
-                pos = session_pos;
-            } else {
-                // New session — restore from system prompt snapshot
-                for (int i = 0; i < NUM_LAYERS; i++) {
-                    if (model->layers[i].is_full) {
-                        size_t sz = snap_kv_len[i] * kv_dim * sizeof(float);
-                        if (sz > 0) {
-                            CHECK_CUDA(cudaMemcpy(model->kv_k[i], snap_kv_k[i], sz, cudaMemcpyHostToDevice));
-                            CHECK_CUDA(cudaMemcpy(model->kv_v[i], snap_kv_v[i], sz, cudaMemcpyHostToDevice));
-                        }
-                        model->kv_len[i] = snap_kv_len[i];
-                    } else {
-                        CHECK_CUDA(cudaMemcpy(model->delta_state[i], snap_delta[i], delta_sz, cudaMemcpyHostToDevice));
-                        CHECK_CUDA(cudaMemcpy(model->conv_state[i], snap_conv[i], conv_sz, cudaMemcpyHostToDevice));
-                    }
-                }
-                pos = sys_pos;
-                if (req_session[0]) {
-                    strncpy(active_session, req_session, sizeof(active_session) - 1);
-                } else {
-                    active_session[0] = '\0';
-                }
-            }
+            // Always reset state and re-prefill full prompt from scratch.
+            // Snapshot restore is lossy on CUDA — produces wrong first tokens.
+            model_reset_state(model);
+            pos = 0;
 
-            // Build per-request prompt (user turn + tools only, system prompt already cached)
+            // Build full prompt: system + user turn
             char *prompt = build_chat_prompt(body, tools_json);
+            // Prepend system prompt
+            char *full_prompt = (char *)malloc(strlen(sys_chatml) + strlen(prompt) + 1);
+            strcpy(full_prompt, sys_chatml);
+            strcat(full_prompt, prompt);
             if (tools_json) free(tools_json);
 
             uint32_t turn_ids[16384];
-            int turn_ntokens = bpe_encode(tokenizer, prompt, turn_ids, 16384);
+            int turn_ntokens = bpe_encode(tokenizer, full_prompt, turn_ids, 16384);
             free(prompt);
+            free(full_prompt);
 
             if (turn_ntokens <= 0) {
                 http_write_str(client_fd, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\":\"tokenization failed\"}\n");
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos);
+            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos); for(int i=0;i<turn_ntokens&&i<10;i++) fprintf(stderr,"  token[%d]=%u\n",i,turn_ids[i]);
 
             // Send SSE headers
             http_write_str(client_fd, SSE_HEADERS);
 
-            // Prefill user turn tokens — last forward() return = first generated token
+            // Prefill full prompt (system + user turn) — last forward() return = first generated token
             int next_token = 0;
             for (int i = 0; i < turn_ntokens; i++) {
                 next_token = forward(model, turn_ids[i], pos++, K);
@@ -3421,7 +3406,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos);
+            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos); for(int i=0;i<turn_ntokens&&i<10;i++) fprintf(stderr,"  token[%d]=%u\n",i,turn_ids[i]);
 
             // Send SSE headers
             static const char *ANTH_SSE_HEADERS =
