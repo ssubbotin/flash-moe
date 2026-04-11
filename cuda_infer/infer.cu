@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <cublas_v2.h>
 
 #include "kernels.cuh"
 
@@ -125,6 +126,10 @@ static int g_use_int8 = 0;
 
 // WMMA tensor core INT8 mode — enabled via --wmma flag (MLX format only)
 static int g_use_wmma = 0;
+
+// cuBLAS INT8 GEMV mode — enabled via --cublas flag (MLX format only)
+static int g_use_cublas = 0;
+static cublasHandle_t g_cublas_handle = NULL;
 
 // Runtime expert size — defaults to compile-time MLX value, overridden for GGUF
 static size_t g_expert_size = EXPERT_SIZE;
@@ -629,6 +634,13 @@ typedef struct {
     float  *buf_q8_scales;   // [max_in_dim / Q8_BLOCK_SIZE]
     float  *buf_q8_sums;     // [max_in_dim / Q8_BLOCK_SIZE]
 
+    // cuBLAS INT8 scratch buffers
+    int8_t  *buf_cublas_w_int8;     // [max_out_dim * max_in_dim] converted INT8 weights
+    float   *buf_cublas_row_scales; // [max_out_dim] per-row scale factors
+    int32_t *buf_cublas_c_int32;    // [max_out_dim] cuBLAS INT32 output
+    float   *buf_cublas_x_scale;    // [1] global activation scale (device)
+    int8_t  *buf_cublas_x_q8;       // [max_in_dim] globally-quantized activation
+
     // ---- VRAM expert cache ----
     // Frequency-weighted LRU cache of experts in GPU memory.
     // Eviction score = access_count * FREQ_WEIGHT + last_used.
@@ -958,6 +970,30 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
         CHECK_CUDA(cudaMalloc(&model->buf_q8, max_in * sizeof(int8_t)));
         CHECK_CUDA(cudaMalloc(&model->buf_q8_scales, q8_blocks * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&model->buf_q8_sums, q8_blocks * sizeof(float)));
+    }
+
+    // cuBLAS INT8 scratch buffers — sized for largest weight matrix
+    // Largest is lm_head: VOCAB_SIZE x HIDDEN_DIM = 248320 x 4096 = 970 MB
+    if (g_use_cublas) {
+        uint32_t max_out_cb = VOCAB_SIZE;  // lm_head has the most output rows
+        uint32_t max_in_cb = HIDDEN_DIM;
+        if (NUM_ATTN_HEADS * HEAD_DIM > (int)max_in_cb) max_in_cb = NUM_ATTN_HEADS * HEAD_DIM;
+        if (LINEAR_CONV_DIM > (int)max_in_cb) max_in_cb = LINEAR_CONV_DIM;
+        // Max weight matrix area: max(out*in) across all matvecs
+        // lm_head = VOCAB_SIZE * HIDDEN_DIM, qkv = LINEAR_CONV_DIM * HIDDEN_DIM, etc.
+        size_t w_int8_size = (size_t)max_out_cb * HIDDEN_DIM;  // lm_head dominates
+        if ((size_t)LINEAR_CONV_DIM * HIDDEN_DIM > w_int8_size)
+            w_int8_size = (size_t)LINEAR_CONV_DIM * HIDDEN_DIM;
+        if ((size_t)(NUM_ATTN_HEADS * HEAD_DIM) * HIDDEN_DIM > w_int8_size)
+            w_int8_size = (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * HIDDEN_DIM;
+        printf("[cublas] Allocating INT8 scratch: %.1f MB (W_int8) + %.1f MB (row_scales+C+x_q8)\n",
+               w_int8_size / (1024.0*1024),
+               (max_out_cb * (sizeof(float) + sizeof(int32_t)) + max_in_cb + sizeof(float)) / (1024.0*1024));
+        CHECK_CUDA(cudaMalloc(&model->buf_cublas_w_int8, w_int8_size));
+        CHECK_CUDA(cudaMalloc(&model->buf_cublas_row_scales, max_out_cb * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&model->buf_cublas_c_int32, max_out_cb * sizeof(int32_t)));
+        CHECK_CUDA(cudaMalloc(&model->buf_cublas_x_scale, sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&model->buf_cublas_x_q8, max_in_cb * sizeof(int8_t)));
     }
 
     // Linear attention persistent state
@@ -1361,6 +1397,50 @@ static inline void do_rms_norm(const float *x, const void *w, float *out,
 // Format-aware matvec wrapper — dispatches MLX or GGUF kernel
 // ============================================================================
 
+static inline void do_cublas_matvec(
+    const uint32_t *W, const uint16_t *S, const uint16_t *B,
+    const float *x, float *out, uint32_t out_dim, uint32_t in_dim,
+    cudaStream_t stream = 0
+) {
+    Model *m = g_model;
+
+    // 1. Convert 4-bit weights to INT8 with absorbed per-group scales
+    launch_convert_4bit_to_int8(W, S, B, m->buf_cublas_w_int8,
+                                 m->buf_cublas_row_scales, out_dim, in_dim, stream);
+
+    // 2. Quantize activation to INT8 with single global scale
+    launch_quantize_x_q8_global(x, m->buf_cublas_x_q8, m->buf_cublas_x_scale,
+                                 in_dim, stream);
+
+    // 3. cuBLAS INT8 GEMV: C_int32[out_dim x 1] = W_int8[out_dim x in_dim] @ x_q8[in_dim x 1]
+    //    cuBLAS is column-major. W_int8 stored row-major [out_dim, in_dim] =
+    //    column-major [in_dim, out_dim]. Use CUBLAS_OP_T to transpose.
+    int32_t alpha_i = 1, beta_i = 0;
+
+    cublasSetStream(g_cublas_handle, stream);
+    cublasStatus_t st = cublasGemmEx(
+        g_cublas_handle,
+        CUBLAS_OP_T,    // transpose A (row-major W_int8 → col-major)
+        CUBLAS_OP_N,    // no transpose B
+        out_dim, 1, in_dim,
+        &alpha_i,
+        m->buf_cublas_w_int8, CUDA_R_8I, in_dim,   // A: [in_dim x out_dim] col-major
+        m->buf_cublas_x_q8,   CUDA_R_8I, in_dim,   // B: [in_dim x 1]
+        &beta_i,
+        m->buf_cublas_c_int32, CUDA_R_32I, out_dim, // C: [out_dim x 1]
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT
+    );
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[cublas] cublasGemmEx failed: %d\n", (int)st);
+    }
+
+    // 4. Post-process: out_f32[i] = C_int32[i] * row_scale[i] * x_scale
+    //    x_scale is read from device memory (no host sync needed)
+    launch_cublas_int32_to_float(m->buf_cublas_c_int32, m->buf_cublas_row_scales,
+                                  m->buf_cublas_x_scale, out, out_dim, stream);
+}
+
 static inline void do_matvec(
     const uint32_t *W, const uint16_t *S, const uint16_t *B,
     const float *x, float *out, uint32_t out_dim, uint32_t in_dim,
@@ -1368,6 +1448,8 @@ static inline void do_matvec(
 ) {
     if (g_quant_format == 1) {
         launch_dequant_matvec_gguf((const void *)W, x, out, out_dim, in_dim, gguf_type, stream);
+    } else if (g_use_cublas) {
+        do_cublas_matvec(W, S, B, x, out, out_dim, in_dim, stream);
     } else if (g_use_wmma) {
         launch_quantize_x_q8(x, g_model->buf_q8, g_model->buf_q8_scales,
                              g_model->buf_q8_sums, in_dim, stream);
@@ -1411,7 +1493,16 @@ static void expert_forward(Model *model, int expert_slot, int layer_idx, const f
         uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
         uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-        if (g_use_wmma || g_use_int8) {
+        if (g_use_cublas) {
+            do_cublas_matvec(gate_w, gate_s, gate_b, input,
+                             model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+            do_cublas_matvec(up_w, up_s, up_b, input,
+                             model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                          MOE_INTERMEDIATE);
+            do_cublas_matvec(down_w, down_s, down_b, model->buf_shared_gate,
+                             output, HIDDEN_DIM, MOE_INTERMEDIATE);
+        } else if (g_use_wmma || g_use_int8) {
             // Quantize input once for gate + up (both use HIDDEN_DIM input)
             launch_quantize_x_q8(input, model->buf_q8, model->buf_q8_scales,
                                  model->buf_q8_sums, HIDDEN_DIM);
@@ -2084,7 +2175,16 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
             uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-            if (g_use_wmma || g_use_int8) {
+            if (g_use_cublas) {
+                do_cublas_matvec(gate_w, gate_s, gate_b, model->buf_normed,
+                                 model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                do_cublas_matvec(up_w, up_s, up_b, model->buf_normed,
+                                 model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                              MOE_INTERMEDIATE);
+                do_cublas_matvec(down_w, down_s, down_b, model->buf_shared_gate,
+                                 model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            } else if (g_use_wmma || g_use_int8) {
                 // Quantize input once for gate + up
                 launch_quantize_x_q8(model->buf_normed, model->buf_q8, model->buf_q8_scales,
                                      model->buf_q8_sums, HIDDEN_DIM);
@@ -3509,12 +3609,13 @@ int main(int argc, char **argv) {
         {"bench",     required_argument, 0, 'B'},
         {"int8",      no_argument,       0, 'I'},
         {"wmma",      no_argument,       0, 'W'},
+        {"cublas",    no_argument,       0, 'C'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:IMWh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:IMWCh", long_options, NULL)) != -1) {
         switch (c) {
             case 'w': weights_path = optarg; break;
             case 'j': manifest_path = optarg; break;
@@ -3529,6 +3630,7 @@ int main(int argc, char **argv) {
             case 'B': bench_iters = atoi(optarg); break;
             case 'I': g_use_int8 = 1; break;
             case 'W': g_use_wmma = 1; break;
+            case 'C': g_use_cublas = 1; break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
                 printf("  --weights PATH   model_weights.bin\n");
@@ -3544,6 +3646,7 @@ int main(int argc, char **argv) {
                 printf("  --bench N        benchmark N tokens with correctness validation\n");
                 printf("  --int8           use INT8 dp4a matvec kernel (MLX format only)\n");
                 printf("  --wmma           use WMMA tensor core INT8 matvec kernel (MLX format only)\n");
+                printf("  --cublas         use cuBLAS INT8 GEMV path (MLX format only)\n");
                 return 0;
             default: return 1;
         }
@@ -3719,6 +3822,25 @@ int main(int argc, char **argv) {
             g_use_int8 = 0;
         } else {
             printf("[init] INT8 dp4a matvec enabled\n");
+        }
+    }
+    if (g_use_cublas) {
+        if (g_quant_format == 1) {
+            fprintf(stderr, "[warn] --cublas not supported with GGUF format, ignoring\n");
+            g_use_cublas = 0;
+        } else {
+            // cuBLAS takes precedence over dp4a / wmma
+            g_use_int8 = 0;
+            g_use_wmma = 0;
+            cublasStatus_t st = cublasCreate(&g_cublas_handle);
+            if (st != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "[error] cublasCreate failed: %d\n", (int)st);
+                return 1;
+            }
+            // Use PEDANTIC math mode for deterministic INT8 results
+            cublasSetMathMode(g_cublas_handle, CUBLAS_DEFAULT_MATH);
+            printf("[init] cuBLAS INT8 GEMV enabled (scratch: %.0f MB)\n",
+                   (double)VOCAB_SIZE * HIDDEN_DIM / (1024.0*1024));
         }
     }
 

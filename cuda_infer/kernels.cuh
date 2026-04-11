@@ -1566,3 +1566,180 @@ __global__ void vec_scale(float* __restrict__ x, float scale, uint32_t n) {
 static inline void launch_residual_add(const float* a, const float* b, float* out, uint32_t dim, cudaStream_t s = 0) {
     residual_add<<<(dim+255)/256, 256, 0, s>>>(a, b, out, dim);
 }
+
+// ============================================================================
+// cuBLAS INT8 support kernels
+// ============================================================================
+
+// Global INT8 activation quantization (single scale for entire vector).
+// Used by cuBLAS path which needs a uniform scale (unlike per-block Q8_1).
+// Phase 1: find max absolute value (reduction into shared memory)
+// Phase 2: quantize + store scale
+// Two-pass: first launch finds max_abs, second quantizes.
+// For simplicity, single kernel with cooperative reduction.
+// Grid: 1, Block: 256
+
+__global__ void quantize_x_q8_global(
+    const float* __restrict__ x,
+    int8_t*      __restrict__ q8,
+    float*       __restrict__ out_scale,  // single float
+    uint32_t dim
+) {
+    __shared__ float shared_max[32];
+
+    // Phase 1: find max_abs
+    float local_max = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = fabsf(x[i]);
+        if (v > local_max) local_max = v;
+    }
+    local_max = warp_reduce_max(local_max);
+    uint32_t wid = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x % 32;
+    if (lane == 0) shared_max[wid] = local_max;
+    __syncthreads();
+    if (wid == 0) {
+        local_max = (lane < (blockDim.x + 31) / 32) ? shared_max[lane] : 0.0f;
+        local_max = warp_reduce_max(local_max);
+        if (lane == 0) shared_max[0] = local_max;
+    }
+    __syncthreads();
+
+    float amax = shared_max[0];
+    float d = amax / 127.0f;
+    float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+
+    if (threadIdx.x == 0) *out_scale = d;
+
+    // Phase 2: quantize
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        int q = __float2int_rn(x[i] * inv_d);
+        q = max(-128, min(127, q));
+        q8[i] = (int8_t)q;
+    }
+}
+
+static inline void launch_quantize_x_q8_global(
+    const float* x, int8_t* q8, float* out_scale,
+    uint32_t dim, cudaStream_t stream = 0
+) {
+    quantize_x_q8_global<<<1, 256, 0, stream>>>(x, q8, out_scale, dim);
+}
+
+// Convert 4-bit packed weights [out_dim x in_dim/8] uint32 + per-group bf16 scale/bias
+// to dense INT8 [out_dim x in_dim] with absorbed scales.
+// For each row: find global max abs dequantized value, compute row_scale,
+// then int8_val = round((nibble * group_scale + group_bias) / row_scale).
+// row_scales[row] is stored for post-multiply after cuBLAS.
+//
+// Grid: (out_dim), Block: 256
+// Each block handles one output row.
+__global__ void convert_4bit_to_int8_absorbed(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ biases,
+    int8_t*         __restrict__ W_int8,
+    float*          __restrict__ row_scales,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    const uint32_t row = blockIdx.x;
+    if (row >= out_dim) return;
+
+    const uint32_t packed_cols = in_dim / 8;
+    const uint32_t num_groups = in_dim / GROUP_SIZE;
+    const uint32_t packed_per_group = GROUP_SIZE / 8;
+
+    const uint32_t* w_row = W_packed + row * packed_cols;
+    const uint16_t* s_row = scales + row * num_groups;
+    const uint16_t* b_row = biases + row * num_groups;
+
+    // Pass 1: find max absolute dequantized value across the row
+    __shared__ float shared_max[32];
+    float local_max = 0.0f;
+
+    for (uint32_t col = threadIdx.x; col < packed_cols; col += blockDim.x) {
+        uint32_t g = col / packed_per_group;
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        for (int n = 0; n < 8; n++) {
+            float val = (float)((packed >> (n * 4)) & 0xF) * scale + bias;
+            float aval = fabsf(val);
+            if (aval > local_max) local_max = aval;
+        }
+    }
+
+    // Warp reduction for max
+    local_max = warp_reduce_max(local_max);
+    uint32_t wid = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x % 32;
+    if (lane == 0) shared_max[wid] = local_max;
+    __syncthreads();
+
+    if (wid == 0) {
+        local_max = (lane < (blockDim.x + 31) / 32) ? shared_max[lane] : 0.0f;
+        local_max = warp_reduce_max(local_max);
+        if (lane == 0) shared_max[0] = local_max;
+    }
+    __syncthreads();
+
+    float row_max = shared_max[0];
+    float row_sc = row_max / 127.0f;
+    float inv_sc = (row_sc > 0.0f) ? (127.0f / row_max) : 0.0f;
+
+    if (threadIdx.x == 0) row_scales[row] = row_sc;
+
+    // Pass 2: quantize to int8
+    int8_t* out_row = W_int8 + (size_t)row * in_dim;
+
+    for (uint32_t col = threadIdx.x; col < packed_cols; col += blockDim.x) {
+        uint32_t g = col / packed_per_group;
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        uint32_t base_idx = col * 8;
+
+        for (int n = 0; n < 8; n++) {
+            float val = (float)((packed >> (n * 4)) & 0xF) * scale + bias;
+            int q = __float2int_rn(val * inv_sc);
+            q = max(-128, min(127, q));
+            out_row[base_idx + n] = (int8_t)q;
+        }
+    }
+}
+
+static inline void launch_convert_4bit_to_int8(
+    const uint32_t* W, const uint16_t* scales, const uint16_t* biases,
+    int8_t* W_int8, float* row_scales,
+    uint32_t out_dim, uint32_t in_dim, cudaStream_t stream = 0
+) {
+    convert_4bit_to_int8_absorbed<<<out_dim, 256, 0, stream>>>(
+        W, scales, biases, W_int8, row_scales, out_dim, in_dim);
+}
+
+// Post-process cuBLAS INT32 output to float:
+//   out_f32[i] = (float)out_i32[i] * row_scale[i] * (*x_scale_ptr)
+// x_scale is read from device memory (avoids host-device sync).
+// Grid: (out_dim + 255) / 256, Block: 256
+__global__ void cublas_int32_to_float(
+    const int32_t* __restrict__ C_int32,
+    const float*   __restrict__ row_scales,
+    const float*   __restrict__ x_scale_ptr,
+    float*         __restrict__ out,
+    uint32_t       n
+) {
+    float x_scale = *x_scale_ptr;
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = (float)C_int32[i] * row_scales[i] * x_scale;
+    }
+}
+
+static inline void launch_cublas_int32_to_float(
+    const int32_t* C, const float* row_scales, const float* x_scale_ptr,
+    float* out, uint32_t n, cudaStream_t stream = 0
+) {
+    cublas_int32_to_float<<<(n + 255) / 256, 256, 0, stream>>>(
+        C, row_scales, x_scale_ptr, out, n);
+}
