@@ -2283,10 +2283,23 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.expert_compute += t1-t0; t0=t1; }
 
+    if (dump) {
+        dump_buf("shared_out", model->buf_shared_out, HIDDEN_DIM, NULL);
+        printf("[L0] shared_expert_gate = %.6f\n", h_seg_score);
+        dump_buf("expert_outs[0]", model->buf_expert_outs, HIDDEN_DIM, NULL);
+        float ew[MAX_K];
+        CHECK_CUDA(cudaMemcpy(ew, model->buf_expert_weights, K * sizeof(float), cudaMemcpyDeviceToHost));
+        printf("[L0] expert_weights:");
+        for (int i = 0; i < K; i++) printf(" %.6f", ew[i]);
+        printf("\n");
+    }
+
     moe_combine_residual<<<(HIDDEN_DIM + 255) / 256, 256>>>(
         model->buf_h_mid, model->buf_shared_out, model->buf_hidden,
         model->buf_expert_outs, model->buf_expert_weights, h_seg_score,
         HIDDEN_DIM, K);
+
+    if (dump) dump_buf("moe_combined", model->buf_hidden, HIDDEN_DIM, NULL);
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.combine += t1-t0;
         g_layer_timing.count++;

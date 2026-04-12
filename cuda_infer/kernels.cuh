@@ -23,6 +23,7 @@
  *  13. compute_decay_beta       — GatedDeltaNet decay and beta gate
  *  14. gated_rms_norm           — RMS norm with SiLU gate and bf16 weights
  *  15. moe_combine_residual     — Weighted expert sum + shared expert + residual
+ *  16. gpu_softmax_topk         — GPU-side softmax + topK for MoE routing
  */
 
 #pragma once
@@ -734,6 +735,9 @@ __global__ void gated_delta_net_step(
 ) {
     uint32_t head_id = blockIdx.x;
     uint32_t vi = threadIdx.x;
+    // Key head mapping is format-dependent:
+    //   MLX:        kh = head_id / k_heads_per_v  (chunked: V heads 0..3 share K head 0)
+    //   llama.cpp:  kh = head_id % num_k_heads    (interleaved: V heads 0,16,32,48 share K head 0)
     uint32_t kh = head_id / k_heads_per_v;
     float g = g_decay[head_id];
     float beta = beta_gate[head_id];
@@ -760,6 +764,7 @@ __global__ void gated_delta_net_step(
     for (uint32_t ki = 0; ki < 128; ki++)
         out_val += state[state_base + ki] * q[k_base + ki];
     output[v_base + vi] = out_val;
+
 }
 
 // ============================================================================
@@ -964,6 +969,362 @@ __global__ void moe_combine_residual(
         moe += weights[k] * expert_outs[k * dim + i];
 
     hidden_out[i] = h_mid[i] + moe + sg * shared_out[i];
+}
+
+// ============================================================================
+// 0a. INT8 activation quantization (Q8_1 format)
+// ============================================================================
+// Q8_1 format: block_size=32 elements.
+//   q8[i] = round(x[i] / d), d = max_abs / 127
+//   sums[block] = sum(q8[i]) — precomputed for bias correction in affine quant
+// Run once before a batch of matvecs sharing the same input vector.
+
+#define Q8_BLOCK_SIZE 32
+
+__global__ void quantize_x_q8(
+    const float* __restrict__ x,
+    int8_t*      __restrict__ q8,
+    float*       __restrict__ q8_scales,
+    float*       __restrict__ q8_sums,
+    uint32_t dim
+) {
+    // One warp per Q8 block (32 elements = warp size on CUDA)
+    uint32_t block_id = blockIdx.x * blockDim.y + threadIdx.y;
+    uint32_t lane = threadIdx.x;
+    uint32_t base = block_id * Q8_BLOCK_SIZE;
+    if (base >= dim) return;
+
+    uint32_t idx = base + lane;
+    float val = (idx < dim) ? x[idx] : 0.0f;
+
+    // Find max absolute value across the warp and broadcast to all lanes
+    float amax = warp_reduce_max(fabsf(val));
+    amax = __shfl_sync(0xFFFFFFFF, amax, 0);
+
+    // Compute scale and quantize
+    float d = amax / 127.0f;
+    float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+    int q = __float2int_rn(val * inv_d);
+    q = max(-128, min(127, q));
+    int8_t q8_val = (int8_t)q;
+
+    // Store sequentially
+    if (idx < dim) q8[idx] = q8_val;
+
+    // Compute sum of q8 values for bias correction
+    float q_sum = warp_reduce_sum((float)q);
+
+    // Lane 0 writes scale and sum
+    if (lane == 0) {
+        q8_scales[block_id] = d;
+        q8_sums[block_id] = q_sum;
+    }
+}
+
+static inline void launch_quantize_x_q8(
+    const float* x, int8_t* q8, float* q8_scales, float* q8_sums,
+    uint32_t dim, cudaStream_t stream = 0
+) {
+    uint32_t num_blocks = (dim + Q8_BLOCK_SIZE - 1) / Q8_BLOCK_SIZE;
+    // 4 warps per threadblock, each warp handles one Q8 block
+    uint32_t warps_per_tb = 4;
+    dim3 block(32, warps_per_tb);
+    dim3 grid((num_blocks + warps_per_tb - 1) / warps_per_tb);
+    quantize_x_q8<<<grid, block, 0, stream>>>(x, q8, q8_scales, q8_sums, dim);
+}
+
+// ============================================================================
+// 0b. dp4a dequant matvec — INT8 dot product
+// ============================================================================
+// Uses pre-quantized int8 activations (Q8_1 format) + uint4 weights.
+// Inner loop: 2 x dp4a per packed uint32 (8 nibbles -> 8 MACs in 2 instructions).
+//
+// Math for our affine quantization (scale + bias per group of 64):
+//   dot(W_row, x) = sum_g [ w_scale_g * sum_i(nibble_i * x_i) + w_bias_g * sum_i(x_i) ]
+// With Q8_1: x_i ~ q8_i * d_x, sum(x_i) ~ d_x * sum(q8_i)
+// So: dot ~ sum_g [ w_scale_g * d_x * idot + w_bias_g * d_x * q8sum ]
+//   where idot = sum(nibble_i * q8_i) via dp4a
+
+#define DP4A_ROWS_PER_BLOCK 4
+
+__global__ void dequant_matvec_4bit_dp4a(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ biases,
+    const int8_t*   __restrict__ q8,
+    const float*    __restrict__ q8_scales,
+    const float*    __restrict__ q8_sums,
+    float*          __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * DP4A_ROWS_PER_BLOCK + warp_id;
+
+    if (row >= out_dim) return;
+
+    const uint32_t packed_cols = in_dim >> 3;          // in_dim / 8
+    const uint32_t num_groups = in_dim >> 6;           // in_dim / GROUP_SIZE(64)
+    const uint32_t packed_per_group = GROUP_SIZE >> 3;  // 64/8 = 8
+
+    const uint32_t* w_row = W_packed + row * packed_cols;
+    const uint16_t* s_row = scales + row * num_groups;
+    const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    // Process one group (64 elements = 8 packed uint32 = 2 Q8 blocks) at a time
+    // Each Q8 block = 32 elements with its own scale/sum
+    for (uint32_t g = lane; g < num_groups; g += 32) {
+        float w_scale = bf16_to_f32(s_row[g]);
+        float w_bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t col_base = g * packed_per_group;  // g * 8
+        uint32_t elem_base = g * GROUP_SIZE;       // g * 64
+
+        // Two Q8 blocks per group: block A (elements 0..31), block B (elements 32..63)
+        uint32_t q8_block_a = elem_base / Q8_BLOCK_SIZE;
+        uint32_t q8_block_b = q8_block_a + 1;
+        float d_a = q8_scales[q8_block_a];
+        float d_b = q8_scales[q8_block_b];
+        float sum_a = q8_sums[q8_block_a];
+        float sum_b = q8_sums[q8_block_b];
+
+        // Integer dot product for first 32 elements (4 packed uint32)
+        int idot_a = 0;
+        const int32_t* q8_row_a = (const int32_t*)(q8 + elem_base);
+        #pragma unroll
+        for (uint32_t p = 0; p < 4; p++) {
+            uint32_t packed = w_row[col_base + p];
+            // Repack nibbles to sequential bytes: {n0,n1,n2,n3} and {n4,n5,n6,n7}
+            uint32_t lo_nib = packed & 0xFFFF;
+            uint32_t hi_nib = packed >> 16;
+            int seq0 = (int)((lo_nib & 0xF) | ((lo_nib & 0xF0) << 4) |
+                             ((lo_nib & 0xF00) << 8) | ((lo_nib & 0xF000) << 12));
+            int seq1 = (int)((hi_nib & 0xF) | ((hi_nib & 0xF0) << 4) |
+                             ((hi_nib & 0xF00) << 8) | ((hi_nib & 0xF000) << 12));
+
+            idot_a = __dp4a(seq0, q8_row_a[p * 2 + 0], idot_a);
+            idot_a = __dp4a(seq1, q8_row_a[p * 2 + 1], idot_a);
+        }
+
+        // Integer dot product for second 32 elements (4 packed uint32)
+        int idot_b = 0;
+        const int32_t* q8_row_b = (const int32_t*)(q8 + elem_base + 32);
+        #pragma unroll
+        for (uint32_t p = 0; p < 4; p++) {
+            uint32_t packed = w_row[col_base + 4 + p];
+            uint32_t lo_nib = packed & 0xFFFF;
+            uint32_t hi_nib = packed >> 16;
+            int seq0 = (int)((lo_nib & 0xF) | ((lo_nib & 0xF0) << 4) |
+                             ((lo_nib & 0xF00) << 8) | ((lo_nib & 0xF000) << 12));
+            int seq1 = (int)((hi_nib & 0xF) | ((hi_nib & 0xF0) << 4) |
+                             ((hi_nib & 0xF00) << 8) | ((hi_nib & 0xF000) << 12));
+
+            idot_b = __dp4a(seq0, q8_row_b[p * 2 + 0], idot_b);
+            idot_b = __dp4a(seq1, q8_row_b[p * 2 + 1], idot_b);
+        }
+
+        // Reconstruct float result: w_scale * (d_x * idot) + w_bias * (d_x * sum_q8)
+        acc += w_scale * (d_a * (float)idot_a + d_b * (float)idot_b)
+             + w_bias  * (d_a * sum_a + d_b * sum_b);
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+static inline void launch_dequant_matvec_dp4a(
+    const uint32_t* W, const uint16_t* scales, const uint16_t* biases,
+    const int8_t* q8, const float* q8_scales, const float* q8_sums,
+    float* out, uint32_t out_dim, uint32_t in_dim,
+    cudaStream_t stream = 0
+) {
+    dim3 block(32, DP4A_ROWS_PER_BLOCK);
+    dim3 grid((out_dim + DP4A_ROWS_PER_BLOCK - 1) / DP4A_ROWS_PER_BLOCK);
+    dequant_matvec_4bit_dp4a<<<grid, block, 0, stream>>>(
+        W, scales, biases, q8, q8_scales, q8_sums, out, out_dim, in_dim);
+}
+
+// ============================================================================
+// 0c. WMMA tensor core dequant matvec — INT8 matrix multiply
+// ============================================================================
+// Uses nvcuda::wmma 16×16×16 int8 tiles for tensor core acceleration.
+// Strategy: Each warp processes 16 output rows. Tiles along K dimension with
+// stride 16. For each tile:
+//   A[16×16] = weight nibbles (16 output rows × 16 K elements), row-major
+//   B[16×16] = activation q8 values in column 0, zeros elsewhere, col-major
+//   C[16×16] += A × B  (only column 0 of C is useful)
+//
+// Weight scales/biases are applied per quantization group (64 elements).
+// Q8 scales are applied per Q8 block (32 elements).
+// Since WMMA tiles are 16 elements and Q8 blocks are 32, two consecutive
+// tiles share the same Q8 scale. We accumulate integer dot products per
+// Q8 block (pairs of tiles), then apply d_x.
+//
+// Shared memory layout per warp:
+//   [0..255]     int8  tile buffer (weight load, then activation load)
+//   [256..1279]  int32 accumulator store (16×16 = 256 int32 = 1024 bytes)
+
+#include <mma.h>
+
+#define WMMA_ROWS_PER_BLOCK 2  // warps per block, each handles 16 output rows
+#define WMMA_SMEM_PER_WARP  1280  // 256 bytes tile + 1024 bytes result
+
+__global__ void dequant_matvec_4bit_wmma(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ biases,
+    const int8_t*   __restrict__ q8,
+    const float*    __restrict__ q8_scales,
+    const float*    __restrict__ q8_sums,
+    float*          __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    using namespace nvcuda::wmma;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row_base = (blockIdx.x * WMMA_ROWS_PER_BLOCK + warp_id) * 16;
+
+    if (row_base >= out_dim) return;
+
+    const uint32_t packed_cols = in_dim >> 3;     // in_dim / 8
+    const uint32_t num_groups = in_dim >> 6;      // in_dim / GROUP_SIZE(64)
+
+    // Shared memory pointers for this warp
+    extern __shared__ char smem_raw[];
+    int8_t* tile_buf = (int8_t*)(smem_raw + warp_id * WMMA_SMEM_PER_WARP);
+    int32_t* c_buf = (int32_t*)(smem_raw + warp_id * WMMA_SMEM_PER_WARP + 256);
+
+    // Float accumulators for 16 output rows (register-resident)
+    float row_acc[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) row_acc[i] = 0.0f;
+
+    // Process input in quantization groups of 64 elements
+    for (uint32_t g = 0; g < num_groups; g++) {
+        uint32_t elem_base = g * GROUP_SIZE;      // g * 64
+        uint32_t col_base = g * (GROUP_SIZE >> 3); // g * 8 (packed uint32 offset)
+
+        // Two Q8 blocks per group
+        uint32_t q8_block_a = elem_base / Q8_BLOCK_SIZE;       // first 32 elems
+        uint32_t q8_block_b = q8_block_a + 1;                  // second 32 elems
+        float d_a = q8_scales[q8_block_a];
+        float d_b = q8_scales[q8_block_b];
+        float sum_a = q8_sums[q8_block_a];
+        float sum_b = q8_sums[q8_block_b];
+
+        // Integer dot products for Q8 block A (elements 0..31 of group = tiles 0,1)
+        // and Q8 block B (elements 32..63 = tiles 2,3)
+        // We accumulate across pairs of WMMA tiles
+        int idot_a[16], idot_b[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) { idot_a[i] = 0; idot_b[i] = 0; }
+
+        // 4 WMMA tiles per group (each 16 elements of K)
+        #pragma unroll
+        for (uint32_t tile = 0; tile < 4; tile++) {
+            uint32_t tile_elem = elem_base + tile * 16;
+            uint32_t tile_packed = col_base + tile * 2;  // 16 elems = 2 packed uint32
+
+            // --- Load weight tile into shared memory (row-major 16×16 int8) ---
+            // 256 bytes, 32 threads → 8 bytes each
+            #pragma unroll
+            for (uint32_t idx = lane; idx < 256; idx += 32) {
+                uint32_t r = idx >> 4;       // row within tile (0..15)
+                uint32_t c = idx & 0xF;      // col within tile (0..15)
+                uint32_t row = row_base + r;
+                if (row < out_dim) {
+                    uint32_t packed_idx = tile_packed + (c >> 3);
+                    uint32_t nibble_pos = c & 7;
+                    uint32_t packed = W_packed[row * packed_cols + packed_idx];
+                    tile_buf[idx] = (int8_t)((packed >> (nibble_pos * 4)) & 0xF);
+                } else {
+                    tile_buf[idx] = 0;
+                }
+            }
+            __syncwarp();
+
+            // Load A fragment from shared memory
+            fragment<matrix_a, 16, 16, 16, signed char, row_major> a_frag;
+            load_matrix_sync(a_frag, (const signed char*)tile_buf, 16);
+
+            // --- Prepare activation tile in shared memory (col-major 16×16 int8) ---
+            // Column 0 = q8 values, columns 1-15 = 0
+            // Col-major layout: element [row][col] at offset col*16 + row
+            #pragma unroll
+            for (uint32_t idx = lane; idx < 256; idx += 32) {
+                tile_buf[idx] = 0;
+            }
+            __syncwarp();
+            // Set column 0 (offsets 0..15 in col-major)
+            if (lane < 16) {
+                tile_buf[lane] = q8[tile_elem + lane];
+            }
+            __syncwarp();
+
+            // Load B fragment from shared memory
+            fragment<matrix_b, 16, 16, 16, signed char, col_major> b_frag;
+            load_matrix_sync(b_frag, (const signed char*)tile_buf, 16);
+
+            // WMMA multiply-accumulate
+            fragment<accumulator, 16, 16, 16, int> c_frag;
+            fill_fragment(c_frag, 0);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+            // Store accumulator to shared memory (row-major 16×16 int32)
+            store_matrix_sync(c_buf, c_frag, 16, mem_row_major);
+            __syncwarp();
+
+            // Extract column 0 for each row — this is the integer dot product
+            // c_buf[r * 16 + 0] = sum over k of A[r][k] * B[k][0]
+            // Only need 16 values, use half the warp
+            if (lane < 16) {
+                int idot = c_buf[lane * 16];
+                if (tile < 2) {
+                    idot_a[lane] += idot;  // tiles 0,1 → Q8 block A
+                } else {
+                    idot_b[lane] += idot;  // tiles 2,3 → Q8 block B
+                }
+            }
+            __syncwarp();
+        }
+
+        // Reconstruct float: w_scale * (d_a * idot_a + d_b * idot_b) + w_bias * (d_a * sum_a + d_b * sum_b)
+        if (lane < 16) {
+            uint32_t row = row_base + lane;
+            if (row < out_dim) {
+                float w_scale = bf16_to_f32(scales[row * num_groups + g]);
+                float w_bias  = bf16_to_f32(biases[row * num_groups + g]);
+                row_acc[lane] += w_scale * (d_a * (float)idot_a[lane] + d_b * (float)idot_b[lane])
+                               + w_bias  * (d_a * sum_a + d_b * sum_b);
+            }
+        }
+    }
+
+    // Write output — only lanes 0..15 have valid results
+    if (lane < 16) {
+        uint32_t row = row_base + lane;
+        if (row < out_dim) out[row] = row_acc[lane];
+    }
+}
+
+static inline void launch_dequant_matvec_wmma(
+    const uint32_t* W, const uint16_t* scales, const uint16_t* biases,
+    const int8_t* q8, const float* q8_scales, const float* q8_sums,
+    float* out, uint32_t out_dim, uint32_t in_dim,
+    cudaStream_t stream = 0
+) {
+    // Each warp handles 16 rows, WMMA_ROWS_PER_BLOCK warps per block
+    uint32_t rows_per_block = WMMA_ROWS_PER_BLOCK * 16;
+    dim3 block(32, WMMA_ROWS_PER_BLOCK);
+    dim3 grid((out_dim + rows_per_block - 1) / rows_per_block);
+    size_t smem = WMMA_ROWS_PER_BLOCK * WMMA_SMEM_PER_WARP;
+    dequant_matvec_4bit_wmma<<<grid, block, smem, stream>>>(
+        W, scales, biases, q8, q8_scales, q8_sums, out, out_dim, in_dim);
 }
 
 // ============================================================================
@@ -1194,4 +1555,333 @@ __global__ void vec_scale(float* __restrict__ x, float scale, uint32_t n) {
 
 static inline void launch_residual_add(const float* a, const float* b, float* out, uint32_t dim, cudaStream_t s = 0) {
     residual_add<<<(dim+255)/256, 256, 0, s>>>(a, b, out, dim);
+}
+
+// ============================================================================
+// cuBLAS INT8 support kernels
+// ============================================================================
+
+// Global INT8 activation quantization (single scale for entire vector).
+// Used by cuBLAS path which needs a uniform scale (unlike per-block Q8_1).
+// Phase 1: find max absolute value (reduction into shared memory)
+// Phase 2: quantize + store scale
+// Two-pass: first launch finds max_abs, second quantizes.
+// For simplicity, single kernel with cooperative reduction.
+// Grid: 1, Block: 256
+
+__global__ void quantize_x_q8_global(
+    const float* __restrict__ x,
+    int8_t*      __restrict__ q8,
+    float*       __restrict__ out_scale,  // single float
+    uint32_t dim
+) {
+    __shared__ float shared_max[32];
+
+    // Phase 1: find max_abs
+    float local_max = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = fabsf(x[i]);
+        if (v > local_max) local_max = v;
+    }
+    local_max = warp_reduce_max(local_max);
+    uint32_t wid = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x % 32;
+    if (lane == 0) shared_max[wid] = local_max;
+    __syncthreads();
+    if (wid == 0) {
+        local_max = (lane < (blockDim.x + 31) / 32) ? shared_max[lane] : 0.0f;
+        local_max = warp_reduce_max(local_max);
+        if (lane == 0) shared_max[0] = local_max;
+    }
+    __syncthreads();
+
+    float amax = shared_max[0];
+    float d = amax / 127.0f;
+    float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+
+    if (threadIdx.x == 0) *out_scale = d;
+
+    // Phase 2: quantize
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        int q = __float2int_rn(x[i] * inv_d);
+        q = max(-128, min(127, q));
+        q8[i] = (int8_t)q;
+    }
+}
+
+static inline void launch_quantize_x_q8_global(
+    const float* x, int8_t* q8, float* out_scale,
+    uint32_t dim, cudaStream_t stream = 0
+) {
+    quantize_x_q8_global<<<1, 256, 0, stream>>>(x, q8, out_scale, dim);
+}
+
+// Convert 4-bit packed weights [out_dim x in_dim/8] uint32 + per-group bf16 scale/bias
+// to dense INT8 [out_dim x in_dim] with absorbed scales.
+// For each row: find global max abs dequantized value, compute row_scale,
+// then int8_val = round((nibble * group_scale + group_bias) / row_scale).
+// row_scales[row] is stored for post-multiply after cuBLAS.
+//
+// Grid: (out_dim), Block: 256
+// Each block handles one output row.
+__global__ void convert_4bit_to_int8_absorbed(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ biases,
+    int8_t*         __restrict__ W_int8,
+    float*          __restrict__ row_scales,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    const uint32_t row = blockIdx.x;
+    if (row >= out_dim) return;
+
+    const uint32_t packed_cols = in_dim / 8;
+    const uint32_t num_groups = in_dim / GROUP_SIZE;
+    const uint32_t packed_per_group = GROUP_SIZE / 8;
+
+    const uint32_t* w_row = W_packed + row * packed_cols;
+    const uint16_t* s_row = scales + row * num_groups;
+    const uint16_t* b_row = biases + row * num_groups;
+
+    // Pass 1: find max absolute dequantized value across the row
+    __shared__ float shared_max[32];
+    float local_max = 0.0f;
+
+    for (uint32_t col = threadIdx.x; col < packed_cols; col += blockDim.x) {
+        uint32_t g = col / packed_per_group;
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        for (int n = 0; n < 8; n++) {
+            float val = (float)((packed >> (n * 4)) & 0xF) * scale + bias;
+            float aval = fabsf(val);
+            if (aval > local_max) local_max = aval;
+        }
+    }
+
+    // Warp reduction for max
+    local_max = warp_reduce_max(local_max);
+    uint32_t wid = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x % 32;
+    if (lane == 0) shared_max[wid] = local_max;
+    __syncthreads();
+
+    if (wid == 0) {
+        local_max = (lane < (blockDim.x + 31) / 32) ? shared_max[lane] : 0.0f;
+        local_max = warp_reduce_max(local_max);
+        if (lane == 0) shared_max[0] = local_max;
+    }
+    __syncthreads();
+
+    float row_max = shared_max[0];
+    float row_sc = row_max / 127.0f;
+    float inv_sc = (row_sc > 0.0f) ? (127.0f / row_max) : 0.0f;
+
+    if (threadIdx.x == 0) row_scales[row] = row_sc;
+
+    // Pass 2: quantize to int8
+    int8_t* out_row = W_int8 + (size_t)row * in_dim;
+
+    for (uint32_t col = threadIdx.x; col < packed_cols; col += blockDim.x) {
+        uint32_t g = col / packed_per_group;
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        uint32_t base_idx = col * 8;
+
+        for (int n = 0; n < 8; n++) {
+            float val = (float)((packed >> (n * 4)) & 0xF) * scale + bias;
+            int q = __float2int_rn(val * inv_sc);
+            q = max(-128, min(127, q));
+            out_row[base_idx + n] = (int8_t)q;
+        }
+    }
+}
+
+static inline void launch_convert_4bit_to_int8(
+    const uint32_t* W, const uint16_t* scales, const uint16_t* biases,
+    int8_t* W_int8, float* row_scales,
+    uint32_t out_dim, uint32_t in_dim, cudaStream_t stream = 0
+) {
+    convert_4bit_to_int8_absorbed<<<out_dim, 256, 0, stream>>>(
+        W, scales, biases, W_int8, row_scales, out_dim, in_dim);
+}
+
+// Post-process cuBLAS INT32 output to float:
+//   out_f32[i] = (float)out_i32[i] * row_scale[i] * (*x_scale_ptr)
+// x_scale is read from device memory (avoids host-device sync).
+// Grid: (out_dim + 255) / 256, Block: 256
+__global__ void cublas_int32_to_float(
+    const int32_t* __restrict__ C_int32,
+    const float*   __restrict__ row_scales,
+    const float*   __restrict__ x_scale_ptr,
+    float*         __restrict__ out,
+    uint32_t       n
+) {
+    float x_scale = *x_scale_ptr;
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = (float)C_int32[i] * row_scales[i] * x_scale;
+    }
+}
+
+static inline void launch_cublas_int32_to_float(
+    const int32_t* C, const float* row_scales, const float* x_scale_ptr,
+    float* out, uint32_t n, cudaStream_t stream = 0
+) {
+    cublas_int32_to_float<<<(n + 255) / 256, 256, 0, stream>>>(
+        C, row_scales, x_scale_ptr, out, n);
+}
+
+// 16. GPU-side softmax + topK for MoE routing
+//
+// Single-block kernel: loads gate scores, computes numerically-stable softmax,
+// then finds top-K indices via K passes of argmax.
+// Launch with 1 block of BLOCK_SIZE threads, shared memory = num_experts * sizeof(float).
+__global__ void gpu_softmax_topk(
+    const float* __restrict__ scores,   // [num_experts]
+    int*   __restrict__ out_indices,     // [k]
+    float* __restrict__ out_weights,     // [k]
+    int num_experts,
+    int k
+) {
+    extern __shared__ float smem[];  // [num_experts]
+
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    // Step 1: Load scores into shared memory
+    for (int i = tid; i < num_experts; i += nthreads)
+        smem[i] = scores[i];
+    __syncthreads();
+
+    // Step 2: Find max for numerical stability (warp-aware block reduce)
+    float local_max = -1e30f;
+    for (int i = tid; i < num_experts; i += nthreads)
+        local_max = fmaxf(local_max, smem[i]);
+
+    // Warp reduce max
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+
+    // Block reduce: use first element of each warp
+    __shared__ float warp_max[32];  // max 32 warps in a block
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) warp_max[warp_id] = local_max;
+    __syncthreads();
+
+    float block_max;
+    if (tid == 0) {
+        block_max = warp_max[0];
+        int num_warps = (nthreads + 31) / 32;
+        for (int w = 1; w < num_warps; w++)
+            block_max = fmaxf(block_max, warp_max[w]);
+        warp_max[0] = block_max;
+    }
+    __syncthreads();
+    block_max = warp_max[0];
+
+    // Step 3: Compute exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < num_experts; i += nthreads) {
+        float e = expf(smem[i] - block_max);
+        smem[i] = e;
+        local_sum += e;
+    }
+    __syncthreads();
+
+    // Warp reduce sum
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+
+    __shared__ float warp_sum[32];
+    if (lane_id == 0) warp_sum[warp_id] = local_sum;
+    __syncthreads();
+
+    float block_sum;
+    if (tid == 0) {
+        block_sum = warp_sum[0];
+        int num_warps = (nthreads + 31) / 32;
+        for (int w = 1; w < num_warps; w++)
+            block_sum += warp_sum[w];
+        warp_sum[0] = block_sum;
+    }
+    __syncthreads();
+    block_sum = warp_sum[0];
+
+    // Step 4: Normalize (softmax)
+    float inv_sum = 1.0f / block_sum;
+    for (int i = tid; i < num_experts; i += nthreads)
+        smem[i] *= inv_sum;
+    __syncthreads();
+
+    // Step 5: K passes of argmax to find top-K
+    // Only thread 0 writes results; all threads participate in reduction
+    for (int pass = 0; pass < k; pass++) {
+        // Each thread finds its local best
+        float local_best_val = -1e30f;
+        int local_best_idx = -1;
+        for (int i = tid; i < num_experts; i += nthreads) {
+            if (smem[i] > local_best_val) {
+                local_best_val = smem[i];
+                local_best_idx = i;
+            }
+        }
+
+        // Warp reduce argmax: carry both value and index
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_val = __shfl_down_sync(0xffffffff, local_best_val, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, local_best_idx, offset);
+            if (other_val > local_best_val) {
+                local_best_val = other_val;
+                local_best_idx = other_idx;
+            }
+        }
+
+        // Block reduce via shared memory
+        __shared__ float warp_best_val[32];
+        __shared__ int warp_best_idx[32];
+        if (lane_id == 0) {
+            warp_best_val[warp_id] = local_best_val;
+            warp_best_idx[warp_id] = local_best_idx;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float best_val = warp_best_val[0];
+            int best_idx = warp_best_idx[0];
+            int num_warps = (nthreads + 31) / 32;
+            for (int w = 1; w < num_warps; w++) {
+                if (warp_best_val[w] > best_val) {
+                    best_val = warp_best_val[w];
+                    best_idx = warp_best_idx[w];
+                }
+            }
+            out_indices[pass] = best_idx;
+            out_weights[pass] = best_val;
+            // Mark this expert as used
+            if (best_idx >= 0) smem[best_idx] = -1e30f;
+        }
+        __syncthreads();
+    }
+
+    // Renormalize top-K weights so they sum to 1.0
+    if (tid == 0) {
+        float wsum = 0.0f;
+        for (int j = 0; j < k; j++) wsum += out_weights[j];
+        if (wsum > 0.0f) {
+            float inv = 1.0f / wsum;
+            for (int j = 0; j < k; j++) out_weights[j] *= inv;
+        }
+    }
+}
+
+static inline void launch_gpu_softmax_topk(
+    const float* scores, int* out_indices, float* out_weights,
+    int num_experts, int k, cudaStream_t stream = 0
+) {
+    gpu_softmax_topk<<<1, 256, num_experts * sizeof(float), stream>>>(
+        scores, out_indices, out_weights, num_experts, k);
 }
