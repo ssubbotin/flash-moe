@@ -2890,7 +2890,7 @@ static char *build_chat_prompt(const char *body, const char *tools_json) {
     }
 
     // End with assistant prompt + thinking mode
-    w += sprintf(w, "<|im_start|>assistant\n<think>\n");
+    w += sprintf(w, "<|im_start|>assistant\n");
     return prompt;
 }
 
@@ -3229,7 +3229,7 @@ static char *build_anthropic_prompt(const char *body, const char *system_prompt)
         }
     }
 
-    w += sprintf(w, "<|im_start|>assistant\n<think>\n");
+    w += sprintf(w, "<|im_start|>assistant\n");
     return prompt;
 }
 
@@ -3480,60 +3480,28 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int in_tool_call = 0;
             int tool_call_count = 0;
             // Check if prompt ended with <think>\n (tokens 248068, 198)
-            int in_thinking = (turn_ntokens >= 2 &&
-                               turn_ids[turn_ntokens - 2] == 248068 &&
-                               turn_ids[turn_ntokens - 1] == 198) ? 1 : 0;
+            int in_thinking = 0;
             int think_tokens = 0;
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
-                // Stop on EOS tokens (only after thinking is done)
-                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
-                    if (in_thinking) {
-                        in_thinking = 0;
-                    }
-                    break;
+                // Stop on EOS tokens
+                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+
+                // Track thinking state: <think> starts, </think> ends
+                if (next_token == 248068) in_thinking = 1;   // <think>
+                if (next_token == 248069) in_thinking = 0;   // </think>
+
+                // Suppress thinking content from output
+                if (in_thinking || next_token == 248068 || next_token == 248069) {
+                    think_tokens++;
+                    gen_count++;
+                    next_token = forward(model, next_token, pos++, K);
+                    continue;
                 }
 
                 // Decode token
                 char decoded[1024] = {};
                 if (vocab_strings[next_token])
                     bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
-
-                // Check for end of thinking
-                if (in_thinking && next_token == 248069) {  // </think>
-                    if (think_tokens < 16) {
-                        // Suppress premature </think> — with long prompts, greedy
-                        // decoding barely favors </think> over content tokens
-                        think_tokens++;
-                        next_token = forward(model, next_token, pos++, K);
-                        gen_count++;
-                        continue;
-                    }
-                    in_thinking = 0;
-                    gen_count++;
-                    next_token = forward(model, next_token, pos++, K);
-                    continue;
-                }
-
-                // Suppress thinking content
-                if (in_thinking) {
-                    think_tokens++;
-                    // Log thinking tokens to file for debugging
-                    { static FILE *tf = NULL;
-                      if (!tf) tf = fopen("/tmp/think.txt", "w");
-                      if (tf) { fputs(decoded, tf); fflush(tf); }
-                    }
-                    // Force end thinking: hard cap or degeneration detected
-                    if (think_tokens > 256 || (think_tokens > 64 && rep_ring_is_degenerate())) {
-                        fprintf(stderr, "[serve] forcing </think> after %d degenerate thinking tokens\n", think_tokens);
-                        in_thinking = 0;
-                        gen_count++;
-                        next_token = forward(model, 248069, pos++, K);  // </think>
-                        continue;
-                    }
-                    gen_count++;
-                    next_token = forward(model, next_token, pos++, K);
-                    continue;
-                }
 
                 // Accumulate in buffer for tool call detection
                 if (gen_buf_len + (int)strlen(decoded) < (int)sizeof(gen_buffer) - 1) {
@@ -3708,39 +3676,26 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int tool_call_count = 0;
             const char *stop_reason = "end_turn";
 
-            int in_thinking = (turn_ntokens >= 2 &&
-                               turn_ids[turn_ntokens - 2] == 248068 &&
-                               turn_ids[turn_ntokens - 1] == 198) ? 1 : 0;
+            int in_thinking = 0;
             int think_tokens = 0;
 
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
 
-                char decoded[1024] = {};
-                if (vocab_strings[next_token])
-                    bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
+                // Track thinking state
+                if (next_token == 248068) in_thinking = 1;
+                if (next_token == 248069) in_thinking = 0;
 
-                // Check for end of thinking
-                if (in_thinking && next_token == 248069) {  // </think>
-                    if (think_tokens < 16) {
-                        think_tokens++;
-                        next_token = forward(model, next_token, pos++, K);
-                        gen_count++;
-                        continue;
-                    }
-                    in_thinking = 0;
-                    gen_count++;
-                    next_token = forward(model, next_token, pos++, K);
-                    continue;
-                }
-
-                // Suppress thinking content
-                if (in_thinking) {
+                if (in_thinking || next_token == 248068 || next_token == 248069) {
                     think_tokens++;
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
                 }
+
+                char decoded[1024] = {};
+                if (vocab_strings[next_token])
+                    bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
 
                 if (strstr(decoded, "<|im_end|>") || strstr(decoded, "<|endoftext|>")) break;
 
