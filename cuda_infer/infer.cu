@@ -1631,6 +1631,8 @@ static FILE *g_expert_log = NULL;
 // Timing accumulator for per-phase breakdown
 static int g_timing_enabled = 0;
 static int g_dump_layer0 = 0;  // set to 1 for GGUF at startup
+static int g_dump_hidden = 0;  // --dump-hidden flag
+static int g_dump_token = 0;   // only dump for first token
 static struct {
     double input_norm, attn_proj, attn_compute, oproj_residual;
     double routing, shared_expert, expert_io, expert_compute, combine;
@@ -1682,15 +1684,32 @@ static void verify_q5k_kernel(Model *model) {
     CHECK_CUDA(cudaFree(d_out));
 }
 
+// Dump helper: saves GPU buffer to file and prints first 5 values
+static void dump_buf(const char *label, float *d_buf, int n, const char *fname) {
+    float h[8];
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(h, d_buf, (n < 8 ? n : 8) * sizeof(float), cudaMemcpyDeviceToHost));
+    printf("[L0] %-20s [0:5]= %12.6f %12.6f %12.6f %12.6f %12.6f\n",
+           label, h[0], h[1], h[2], h[3], h[4]);
+    if (fname) {
+        float *full = (float*)malloc(n * sizeof(float));
+        CHECK_CUDA(cudaMemcpy(full, d_buf, n * sizeof(float), cudaMemcpyDeviceToHost));
+        FILE *f = fopen(fname, "wb"); fwrite(full, sizeof(float), n, f); fclose(f);
+        free(full);
+    }
+}
+
 static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     auto &L = model->layers[layer_idx];
     double t0, t1;
+    int dump = (g_dump_hidden && layer_idx == 0 && pos == 0);
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t0 = now_ms(); }
 
     // 1. Input RMS norm
     do_rms_norm(model->buf_hidden, L.input_norm_w, model->buf_normed,
                 HIDDEN_DIM, RMS_NORM_EPS);
+    if (dump) dump_buf("input_normed", model->buf_normed, HIDDEN_DIM, "/tmp/cuda_L0_normed.bin");
 
     // Save residual
     CHECK_CUDA(cudaMemcpy(model->buf_residual, model->buf_hidden,
@@ -1813,12 +1832,18 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         // Linear attention (GatedDeltaNet) path — all on GPU
         do_matvec(L.qkv_w, L.qkv_s, L.qkv_b, model->buf_normed,
                   model->buf_q_proj, LINEAR_CONV_DIM, HIDDEN_DIM, L.qt_qkv);
+        if (dump) dump_buf("qkv_proj", model->buf_q_proj, LINEAR_CONV_DIM, "/tmp/cuda_L0_qkv.bin");
         do_matvec(L.z_w, L.z_s, L.z_b, model->buf_normed,
                   model->buf_z_proj, LINEAR_TOTAL_VALUE, HIDDEN_DIM, L.qt_z);
         do_matvec(L.b_w, L.b_s, L.b_b, model->buf_normed,
                   model->buf_beta_proj, LINEAR_NUM_V_HEADS, HIDDEN_DIM, L.qt_b);
         do_matvec(L.a_w, L.a_s, L.a_b, model->buf_normed,
                   model->buf_alpha_proj, LINEAR_NUM_V_HEADS, HIDDEN_DIM, L.qt_a);
+        if (dump) {
+            dump_buf("z_proj", model->buf_z_proj, LINEAR_TOTAL_VALUE, NULL);
+            dump_buf("alpha_proj", model->buf_alpha_proj, LINEAR_NUM_V_HEADS, NULL);
+            dump_buf("beta_proj", model->buf_beta_proj, LINEAR_NUM_V_HEADS, NULL);
+        }
 
         // Dump raw QKV before conv1d
         if (layer_idx == 0 && g_dump_layer0) {
@@ -1834,6 +1859,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         conv1d_step<<<(LINEAR_CONV_DIM + 255) / 256, 256>>>(
             model->conv_state[layer_idx], model->buf_q_proj,
             L.conv1d_w, model->buf_conv_output, LINEAR_CONV_DIM);
+        if (dump) dump_buf("after_conv1d", model->buf_conv_output, LINEAR_CONV_DIM, "/tmp/cuda_L0_conv.bin");
 
         // Dump layer 0 intermediates for comparison with Python reference
         if (layer_idx == 0 && g_dump_layer0) {
@@ -1875,6 +1901,11 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                 model->buf_conv_output,
                 model->buf_conv_output + LINEAR_TOTAL_KEY,
                 LINEAR_KEY_DIM, inv_scale);
+        }
+        if (dump) {
+            dump_buf("Q_normed", model->buf_conv_output, LINEAR_TOTAL_KEY, "/tmp/cuda_L0_Q.bin");
+            dump_buf("K_normed", model->buf_conv_output + LINEAR_TOTAL_KEY, LINEAR_TOTAL_KEY, "/tmp/cuda_L0_K.bin");
+            dump_buf("V_raw", model->buf_conv_output + 2*LINEAR_TOTAL_KEY, LINEAR_TOTAL_VALUE, "/tmp/cuda_L0_V.bin");
         }
 
         if (layer_idx == 0 && g_dump_layer0) {
@@ -1919,6 +1950,10 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                 model->buf_g_decay, model->buf_beta_gate);
         }
 
+        if (dump) {
+            dump_buf("decay", model->buf_g_decay, LINEAR_NUM_V_HEADS, "/tmp/cuda_L0_decay.bin");
+            dump_buf("beta_gate", model->buf_beta_gate, LINEAR_NUM_V_HEADS, "/tmp/cuda_L0_beta.bin");
+        }
         if (layer_idx == 0 && g_dump_layer0) {
             float dd[5], db[5];
             CHECK_CUDA(cudaDeviceSynchronize());
@@ -1947,6 +1982,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             model->buf_conv_output + 2 * LINEAR_TOTAL_KEY,    // v [8192]
             model->buf_g_decay, model->buf_beta_gate,
             model->buf_delta_output, khpv);
+        if (dump) dump_buf("delta_out", model->buf_delta_output, LINEAR_TOTAL_VALUE, "/tmp/cuda_L0_delta.bin");
 
         if (layer_idx == 0 && g_dump_layer0) {
             float d5[5];
@@ -1986,10 +2022,12 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             printf("[ref] Saved gated_norm (%d floats) to /tmp/cuda_gated_norm.bin\n", LINEAR_TOTAL_VALUE);
         }
 
-        // Output projection
+        // Gated norm + output projection
+        if (dump) dump_buf("gated_norm", model->buf_attn_out, LINEAR_TOTAL_VALUE, "/tmp/cuda_L0_gated.bin");
         do_matvec(L.out_proj_w, L.out_proj_s, L.out_proj_b,
                   model->buf_attn_out, model->buf_h_mid,
                   HIDDEN_DIM, LINEAR_TOTAL_VALUE, L.qt_out);
+        if (dump) dump_buf("out_proj", model->buf_h_mid, HIDDEN_DIM, "/tmp/cuda_L0_oproj.bin");
 
         if (layer_idx == 0 && g_dump_layer0) {
             float d5[5];
@@ -2004,8 +2042,10 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
     // 3. Residual + post-attention norm
     launch_residual_add(model->buf_residual, model->buf_h_mid, model->buf_h_mid, HIDDEN_DIM);
+    if (dump) dump_buf("attn+residual", model->buf_h_mid, HIDDEN_DIM, NULL);
     do_rms_norm(model->buf_h_mid, L.post_attn_norm_w, model->buf_normed,
                 HIDDEN_DIM, RMS_NORM_EPS);
+    if (dump) dump_buf("post_attn_norm", model->buf_normed, HIDDEN_DIM, NULL);
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.oproj_residual += t1-t0; t0=t1; }
 
@@ -2020,6 +2060,12 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     float expert_weights[MAX_K];
     CHECK_CUDA(cudaMemcpy(expert_ids, model->buf_expert_ids, K * sizeof(int), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(expert_weights, model->buf_expert_weights, K * sizeof(float), cudaMemcpyDeviceToHost));
+    if (dump) {
+        printf("[L0] routing: experts=[%d,%d,%d,%d,%d,%d,%d,%d] weights=[%.4f,%.4f,%.4f,%.4f]\n",
+               expert_ids[0],expert_ids[1],expert_ids[2],expert_ids[3],
+               expert_ids[4],expert_ids[5],expert_ids[6],expert_ids[7],
+               expert_weights[0],expert_weights[1],expert_weights[2],expert_weights[3]);
+    }
 
     if (g_expert_log)
         fprintf(g_expert_log, "%d %d %d %d %d\n", layer_idx,
@@ -2398,22 +2444,32 @@ static int forward(Model *model, int token_id, int pos, int K) {
     // Embedding
     embed_token(model, token_id);
 
+    if (g_dump_hidden && g_dump_token == 0) {
+        float h[HIDDEN_DIM];
+        CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_CUDA(cudaMemcpy(h, model->buf_hidden, HIDDEN_DIM*sizeof(float), cudaMemcpyDeviceToHost));
+        FILE *df = fopen("/tmp/cuda_embed.bin", "wb");
+        fwrite(h, sizeof(float), HIDDEN_DIM, df); fclose(df);
+        printf("[dump] embed[0:5] = %.6f %.6f %.6f %.6f %.6f\n", h[0],h[1],h[2],h[3],h[4]);
+    }
+
     // Reset timing
     if (g_timing_enabled) memset(&g_layer_timing, 0, sizeof(g_layer_timing));
 
     // 60 layers
     for (int i = 0; i < NUM_LAYERS; i++) {
         layer_forward(model, i, pos, K);
-        // Dump hidden state every layer (first token only)
-        static int layer_dump = 1;
-        if (layer_dump && g_quant_format == 1) {
-            float d5[5];
+
+        if (g_dump_hidden && g_dump_token == 0) {
+            float h[HIDDEN_DIM];
             CHECK_CUDA(cudaDeviceSynchronize());
-            CHECK_CUDA(cudaMemcpy(d5, model->buf_hidden, 5*sizeof(float), cudaMemcpyDeviceToHost));
-            float mag = 0; for (int j = 0; j < 5; j++) mag += d5[j]*d5[j];
-            printf("[ref] L%02d hidden = %10.6f %10.6f %10.6f %10.6f %10.6f  mag=%.4f\n",
-                   i, d5[0],d5[1],d5[2],d5[3],d5[4], sqrtf(mag));
-            if (i == NUM_LAYERS-1) layer_dump = 0;
+            CHECK_CUDA(cudaMemcpy(h, model->buf_hidden, HIDDEN_DIM*sizeof(float), cudaMemcpyDeviceToHost));
+            char fname[64]; snprintf(fname, 64, "/tmp/cuda_layer%02d.bin", i);
+            FILE *df = fopen(fname, "wb");
+            fwrite(h, sizeof(float), HIDDEN_DIM, df); fclose(df);
+            printf("[dump] L%02d hidden[0:5] = %.6f %.6f %.6f %.6f %.6f\n",
+                   i, h[0],h[1],h[2],h[3],h[4]);
+            if (i == NUM_LAYERS - 1) g_dump_token = 1;
         }
     }
 
@@ -2483,6 +2539,24 @@ static int forward(Model *model, int token_id, int pos, int K) {
         printf("[ref] Top-10 logits:\n");
         for (int i = 0; i < 10; i++) printf("  #%d: token %d = %.4f\n", i+1, top[i], topv[i]);
         logit_dump = 0;
+    }
+
+    // Top-5 logit dump
+    if (g_dump_hidden) {
+        int top[5] = {0}; float topv[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+        for (int i = 0; i < VOCAB_SIZE; i++) {
+            int mn = 0;
+            for (int j = 1; j < 5; j++) if (topv[j] < topv[mn]) mn = j;
+            if (model->h_logits[i] > topv[mn]) { topv[mn] = model->h_logits[i]; top[mn] = i; }
+        }
+        for (int a = 0; a < 4; a++) for (int b = a+1; b < 5; b++)
+            if (topv[b] > topv[a]) { float t=topv[a]; topv[a]=topv[b]; topv[b]=t; int ti=top[a]; top[a]=top[b]; top[b]=ti; }
+        printf("[logits] top-5:");
+        for (int i = 0; i < 5; i++) printf(" %d(%.2f)", top[i], topv[i]);
+        printf("\n");
+        // Save full logits
+        FILE *lf = fopen("/tmp/cuda_logits.bin", "wb");
+        if (lf) { fwrite(model->h_logits, sizeof(float), VOCAB_SIZE, lf); fclose(lf); }
     }
 
     return sample_token(model->h_logits, VOCAB_SIZE);
@@ -3791,6 +3865,7 @@ int main(int argc, char **argv) {
         {"temp",      required_argument, 0, 'R'},
         {"rep-penalty", required_argument, 0, 'p'},
         {"greedy",    no_argument,       0, 'G'},
+        {"dump-hidden", no_argument,     0, 'D'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -3817,6 +3892,7 @@ int main(int argc, char **argv) {
             case 'R': g_temperature = atof(optarg); break;
             case 'p': g_rep_penalty = atof(optarg); break;
             case 'G': g_temperature = 0; g_rep_penalty = 1.0f; break;
+            case 'D': g_dump_hidden = 1; break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
                 printf("  --weights PATH   model_weights.bin\n");
