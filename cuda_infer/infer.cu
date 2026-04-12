@@ -2248,7 +2248,146 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 }
 
 // ============================================================================
-// Full forward pass: embedding → 60 layers → norm → lm_head → argmax
+// Sampling: temperature, top-p, repetition penalty
+// ============================================================================
+
+static float g_temperature = 0.6f;
+static float g_top_p = 0.95f;
+static float g_rep_penalty = 1.3f;
+
+// Ring buffer for repetition penalty — tracks last N generated tokens
+#define REP_WINDOW 1024
+static int g_rep_ring[REP_WINDOW];
+static int g_rep_pos = 0;
+static int g_rep_count = 0;
+
+static void rep_ring_push(int token) {
+    g_rep_ring[g_rep_pos % REP_WINDOW] = token;
+    g_rep_pos++;
+    if (g_rep_count < REP_WINDOW) g_rep_count++;
+}
+
+static void rep_ring_clear(void) {
+    g_rep_pos = 0;
+    g_rep_count = 0;
+}
+
+// Check if last 64 tokens show degenerate patterns.
+// Uses two signals: too many unique tokens from rare ranges (>248000 = special tokens,
+// or tokens that decode to 1-2 bytes = single chars), and low text-to-token ratio.
+static char **g_vocab_for_degen = NULL;
+
+static int has_ascii_letter(const char *s) {
+    if (!s) return 0;
+    for (; *s; s++)
+        if ((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z')) return 1;
+    return 0;
+}
+
+static int rep_ring_is_degenerate(void) {
+    if (g_rep_count < 32 || !g_vocab_for_degen) return 0;
+    int no_letter = 0;
+    for (int i = 0; i < 32; i++) {
+        int tok = g_rep_ring[(g_rep_pos - 1 - i + REP_WINDOW * 2) % REP_WINDOW];
+        const char *s = (tok < VOCAB_SIZE) ? g_vocab_for_degen[tok] : NULL;
+        if (!has_ascii_letter(s)) no_letter++;
+    }
+    return no_letter > 24;  // > 75% of last 32 tokens without letters = degenerate
+}
+
+static int sample_token(float *logits, int vocab_size) {
+    // 1. Repetition penalty: reduce logits of recently generated tokens
+    if (g_rep_penalty != 1.0f) {
+        for (int i = 0; i < g_rep_count; i++) {
+            int tok = g_rep_ring[(g_rep_pos - 1 - i + REP_WINDOW * 2) % REP_WINDOW];
+            if (logits[tok] > 0) logits[tok] /= g_rep_penalty;
+            else                 logits[tok] *= g_rep_penalty;
+        }
+    }
+
+    // 2. Temperature=0 → greedy
+    if (g_temperature < 1e-6f) {
+        int best = 0;
+        for (int i = 1; i < vocab_size; i++)
+            if (logits[i] > logits[best]) best = i;
+        rep_ring_push(best);
+        return best;
+    }
+
+    // 3. Apply temperature
+    float inv_temp = 1.0f / g_temperature;
+    float max_logit = logits[0];
+    for (int i = 1; i < vocab_size; i++)
+        if (logits[i] > max_logit) max_logit = logits[i];
+
+    // Softmax with temperature
+    float sum = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] = expf((logits[i] - max_logit) * inv_temp);
+        sum += logits[i];
+    }
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < vocab_size; i++)
+        logits[i] *= inv_sum;
+
+    // 4. Top-p (nucleus) sampling: sort by probability, keep cumulative < top_p
+    // Use partial sort — find threshold probability
+    if (g_top_p < 1.0f) {
+        // Find top-p cutoff by collecting candidates above threshold
+        // Quick approach: iteratively find the cutoff
+        float cumsum = 0;
+        float threshold = 0;
+        // Sort indices by probability (descending) — use selection for top-k
+        // For efficiency, find the min probability that keeps cumsum < top_p
+        for (int pass = 0; pass < 2; pass++) {
+            // Pass 0: estimate threshold, Pass 1: apply
+            if (pass == 0) {
+                // Collect top probabilities
+                float sorted[1024];
+                int n_sorted = 0;
+                for (int i = 0; i < vocab_size && n_sorted < 1024; i++)
+                    if (logits[i] > 1e-8f) sorted[n_sorted++] = logits[i];
+                // Sort descending
+                for (int a = 0; a < n_sorted - 1; a++)
+                    for (int b = a + 1; b < n_sorted; b++)
+                        if (sorted[b] > sorted[a]) { float t = sorted[a]; sorted[a] = sorted[b]; sorted[b] = t; }
+                cumsum = 0;
+                for (int i = 0; i < n_sorted; i++) {
+                    cumsum += sorted[i];
+                    if (cumsum >= g_top_p) { threshold = sorted[i]; break; }
+                }
+            } else {
+                // Zero out tokens below threshold
+                sum = 0;
+                for (int i = 0; i < vocab_size; i++) {
+                    if (logits[i] < threshold) logits[i] = 0;
+                    sum += logits[i];
+                }
+                if (sum > 0) {
+                    inv_sum = 1.0f / sum;
+                    for (int i = 0; i < vocab_size; i++) logits[i] *= inv_sum;
+                }
+            }
+        }
+    }
+
+    // 5. Random sample from distribution
+    float r = (float)rand() / (float)RAND_MAX;
+    float acc = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        acc += logits[i];
+        if (acc >= r) {
+            rep_ring_push(i);
+            return i;
+        }
+    }
+    // Fallback
+    rep_ring_push(vocab_size - 1);
+    return vocab_size - 1;
+}
+
+// ============================================================================
+// Full forward pass: embedding → 60 layers → norm → lm_head → sample
 // ============================================================================
 
 static int forward(Model *model, int token_id, int pos, int K) {
@@ -2346,15 +2485,7 @@ static int forward(Model *model, int token_id, int pos, int K) {
         logit_dump = 0;
     }
 
-    int best = 0;
-    float best_val = model->h_logits[0];
-    for (int i = 1; i < VOCAB_SIZE; i++) {
-        if (model->h_logits[i] > best_val) {
-            best_val = model->h_logits[i];
-            best = i;
-        }
-    }
-    return best;
+    return sample_token(model->h_logits, VOCAB_SIZE);
 }
 
 // ============================================================================
@@ -2456,6 +2587,13 @@ static int extract_max_tokens(const char *buf, int def) {
     if (!p) return def;
     p = strchr(p, ':');
     return p ? atoi(p + 1) : def;
+}
+
+static float extract_temperature(const char *buf, float def) {
+    const char *p = strstr(buf, "\"temperature\"");
+    if (!p) return def;
+    p = strchr(p, ':');
+    return p ? atof(p + 1) : def;
 }
 
 static int sse_send_delta(int fd, const char *req_id, const char *token_text) {
@@ -3171,6 +3309,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 
             int max_gen = extract_max_tokens(body, 4096);
             if (max_gen > 32768) max_gen = 32768;
+            g_temperature = extract_temperature(body, g_temperature);
 
             // Extract tools and session_id
             char *tools_json = extract_tools_json(body);
@@ -3193,6 +3332,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             // Always reset state and re-prefill full prompt from scratch.
             // Snapshot restore is lossy on CUDA — produces wrong first tokens.
             model_reset_state(model);
+            rep_ring_clear();
             pos = 0;
 
             // Build full prompt: system + user turn
@@ -3220,8 +3360,27 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 
             // Prefill full prompt (system + user turn) — last forward() return = first generated token
             int next_token = 0;
+            double t_prefill = now_ms();
             for (int i = 0; i < turn_ntokens; i++) {
                 next_token = forward(model, turn_ids[i], pos++, K);
+            }
+            double prefill_ms = now_ms() - t_prefill;
+            fprintf(stderr, "[serve] %s prefill %d tokens in %.0fms (%.1f tok/s), first_gen=%d\n",
+                    request_id, turn_ntokens, prefill_ms,
+                    turn_ntokens / (prefill_ms / 1000.0), next_token);
+            // Dump top-5 logits for debugging
+            {
+                int top[5] = {0}; float topv[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+                for (int i = 0; i < VOCAB_SIZE; i++) {
+                    int mn = 0;
+                    for (int j = 1; j < 5; j++) if (topv[j] < topv[mn]) mn = j;
+                    if (model->h_logits[i] > topv[mn]) { topv[mn] = model->h_logits[i]; top[mn] = i; }
+                }
+                for (int i = 0; i < 4; i++) for (int j = i+1; j < 5; j++)
+                    if (topv[j] > topv[i]) { float tv=topv[i]; topv[i]=topv[j]; topv[j]=tv; int ti=top[i]; top[i]=top[j]; top[j]=ti; }
+                fprintf(stderr, "[serve] top-5 logits:");
+                for (int i = 0; i < 5; i++) fprintf(stderr, " %d(%.2f)", top[i], topv[i]);
+                fprintf(stderr, "\n");
             }
 
             double t_gen = now_ms();
@@ -3238,8 +3397,6 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                                turn_ids[turn_ntokens - 2] == 248068 &&
                                turn_ids[turn_ntokens - 1] == 198) ? 1 : 0;
             int think_tokens = 0;
-            int think_budget = max_gen / 2;
-
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
                 // Stop on EOS tokens (only after thinking is done)
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
@@ -3256,27 +3413,36 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 
                 // Check for end of thinking
                 if (in_thinking && next_token == 248069) {  // </think>
+                    if (think_tokens < 16) {
+                        // Suppress premature </think> — with long prompts, greedy
+                        // decoding barely favors </think> over content tokens
+                        think_tokens++;
+                        next_token = forward(model, next_token, pos++, K);
+                        gen_count++;
+                        continue;
+                    }
                     in_thinking = 0;
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
                 }
 
-                // Think budget: force end thinking if exceeded
-                if (in_thinking) {
-                    think_tokens++;
-                    if (think_tokens >= think_budget) {
-                        // Force </think> token to end thinking
-                        next_token = 248069;  // </think>
-                        in_thinking = 0;
-                        gen_count++;
-                        next_token = forward(model, 248069, pos++, K);
-                        continue;
-                    }
-                }
-
                 // Suppress thinking content
                 if (in_thinking) {
+                    think_tokens++;
+                    // Log thinking tokens to file for debugging
+                    { static FILE *tf = NULL;
+                      if (!tf) tf = fopen("/tmp/think.txt", "w");
+                      if (tf) { fputs(decoded, tf); fflush(tf); }
+                    }
+                    // Force end thinking: hard cap or degeneration detected
+                    if (think_tokens > 256 || (think_tokens > 64 && rep_ring_is_degenerate())) {
+                        fprintf(stderr, "[serve] forcing </think> after %d degenerate thinking tokens\n", think_tokens);
+                        in_thinking = 0;
+                        gen_count++;
+                        next_token = forward(model, 248069, pos++, K);  // </think>
+                        continue;
+                    }
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
@@ -3459,7 +3625,6 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                                turn_ids[turn_ntokens - 2] == 248068 &&
                                turn_ids[turn_ntokens - 1] == 198) ? 1 : 0;
             int think_tokens = 0;
-            int think_budget = max_gen / 2;
 
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
@@ -3470,26 +3635,21 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 
                 // Check for end of thinking
                 if (in_thinking && next_token == 248069) {  // </think>
+                    if (think_tokens < 16) {
+                        think_tokens++;
+                        next_token = forward(model, next_token, pos++, K);
+                        gen_count++;
+                        continue;
+                    }
                     in_thinking = 0;
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
                 }
 
-                // Think budget: force end thinking if exceeded
-                if (in_thinking) {
-                    think_tokens++;
-                    if (think_tokens >= think_budget) {
-                        next_token = 248069;
-                        in_thinking = 0;
-                        gen_count++;
-                        next_token = forward(model, 248069, pos++, K);
-                        continue;
-                    }
-                }
-
                 // Suppress thinking content
                 if (in_thinking) {
+                    think_tokens++;
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
@@ -3597,6 +3757,7 @@ static void model_reset_state(Model *model) {
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);  // unbuffered stdout for serve mode
+    srand((unsigned)time(NULL));
     { const char *elog = getenv("EXPERT_LOG");
       if (elog) { g_expert_log = fopen(elog, "w"); } }
     const char *weights_path = "model_weights.bin";
@@ -3627,13 +3788,16 @@ int main(int argc, char **argv) {
         {"wmma",      no_argument,       0, 'W'},
         {"cublas",    no_argument,       0, 'C'},
         {"prompt-file", required_argument, 0, 'F'},
+        {"temp",      required_argument, 0, 'R'},
+        {"rep-penalty", required_argument, 0, 'p'},
+        {"greedy",    no_argument,       0, 'G'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     const char *prompt_file = NULL;
     int c;
-    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:F:IMWCh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:B:F:R:p:GIMWCh", long_options, NULL)) != -1) {
         switch (c) {
             case 'w': weights_path = optarg; break;
             case 'j': manifest_path = optarg; break;
@@ -3650,6 +3814,9 @@ int main(int argc, char **argv) {
             case 'W': g_use_wmma = 1; break;
             case 'C': g_use_cublas = 1; break;
             case 'F': prompt_file = optarg; break;
+            case 'R': g_temperature = atof(optarg); break;
+            case 'p': g_rep_penalty = atof(optarg); break;
+            case 'G': g_temperature = 0; g_rep_penalty = 1.0f; break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
                 printf("  --weights PATH   model_weights.bin\n");
@@ -3865,6 +4032,7 @@ int main(int argc, char **argv) {
 
     // Serve mode
     if (serve_port > 0) {
+        g_vocab_for_degen = vocab_strings;
         serve_loop(model, vocab_strings, &tokenizer, serve_port, K);
         return 0;
     }
