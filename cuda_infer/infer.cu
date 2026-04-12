@@ -105,7 +105,7 @@ extern "C" {
 #define PARTIAL_ROTARY      0.25f
 #endif
 #define ROTARY_DIM          ((int)(HEAD_DIM * PARTIAL_ROTARY))
-#define MAX_SEQ_LEN         4096
+#define MAX_SEQ_LEN         131072
 
 // Expert layout — computed from dimensions if not overridden
 #ifndef EXPERT_SIZE
@@ -2252,6 +2252,10 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 // ============================================================================
 
 static int forward(Model *model, int token_id, int pos, int K) {
+    if (pos >= MAX_SEQ_LEN) {
+        fprintf(stderr, "[error] position %d exceeds MAX_SEQ_LEN %d\n", pos, MAX_SEQ_LEN);
+        return 248046;  // <|im_end|> — stop generation gracefully
+    }
     // Embedding
     embed_token(model, token_id);
 
@@ -3229,15 +3233,17 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int gen_buf_len = 0;
             int in_tool_call = 0;
             int tool_call_count = 0;
-            int in_thinking = 1;  // Start in thinking mode (prompt ends with <think>\n)
+            // Check if prompt ended with <think>\n (tokens 248068, 198)
+            int in_thinking = (turn_ntokens >= 2 &&
+                               turn_ids[turn_ntokens - 2] == 248068 &&
+                               turn_ids[turn_ntokens - 1] == 198) ? 1 : 0;
+            int think_tokens = 0;
+            int think_budget = max_gen / 2;
 
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
                 // Stop on EOS tokens (only after thinking is done)
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
                     if (in_thinking) {
-                        // Model ended turn during thinking without </think>.
-                        // Treat as end of thinking and continue — model may
-                        // produce response after the <|im_end|>.
                         in_thinking = 0;
                     }
                     break;
@@ -3254,6 +3260,19 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
+                }
+
+                // Think budget: force end thinking if exceeded
+                if (in_thinking) {
+                    think_tokens++;
+                    if (think_tokens >= think_budget) {
+                        // Force </think> token to end thinking
+                        next_token = 248069;  // </think>
+                        in_thinking = 0;
+                        gen_count++;
+                        next_token = forward(model, 248069, pos++, K);
+                        continue;
+                    }
                 }
 
                 // Suppress thinking content
@@ -3436,7 +3455,11 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int tool_call_count = 0;
             const char *stop_reason = "end_turn";
 
-            int in_thinking = 1;  // Start in thinking mode (prompt ends with <think>\n)
+            int in_thinking = (turn_ntokens >= 2 &&
+                               turn_ids[turn_ntokens - 2] == 248068 &&
+                               turn_ids[turn_ntokens - 1] == 198) ? 1 : 0;
+            int think_tokens = 0;
+            int think_budget = max_gen / 2;
 
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
@@ -3451,6 +3474,18 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                     gen_count++;
                     next_token = forward(model, next_token, pos++, K);
                     continue;
+                }
+
+                // Think budget: force end thinking if exceeded
+                if (in_thinking) {
+                    think_tokens++;
+                    if (think_tokens >= think_budget) {
+                        next_token = 248069;
+                        in_thinking = 0;
+                        gen_count++;
+                        next_token = forward(model, 248069, pos++, K);
+                        continue;
+                    }
                 }
 
                 // Suppress thinking content
