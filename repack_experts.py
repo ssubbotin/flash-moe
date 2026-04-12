@@ -198,7 +198,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     fd_packed = os.open(out_path, os.O_RDONLY)
 
     mismatches = 0
-    for expert_idx in [0, 1, 255, 511]:  # spot check several experts
+    for expert_idx in [0, 1, NUM_EXPERTS // 2, NUM_EXPERTS - 1]:  # spot check several experts
         for comp in COMPONENTS:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
@@ -215,7 +215,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     os.close(fd_packed)
 
     if mismatches == 0:
-        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, 255, 511)")
+        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, {NUM_EXPERTS//2}, {NUM_EXPERTS-1})")
     else:
         print(f"  Layer {layer_idx}: verification FAILED ({mismatches} mismatches)")
 
