@@ -212,11 +212,20 @@ __global__ void dequant_matvec_4bit_fma_vec4(
 // ============================================================================
 // 1d. Symmetric int4 dequant matvec — compressed-tensors format (Kimi K2.6)
 // ============================================================================
-// Format (matches HF compressed-tensors sym-int4, group_size=32):
-//   W_packed:  uint32[out_dim, in_dim/8] — 8 signed int4 per uint32, LSB-first.
-//              Nibble k (k∈0..7) occupies bits [4k, 4k+4); each is two's-complement [-8..7].
+// Format (matches HF compressed-tensors sym-int4 pack_quantized, group_size=32):
+//   W_packed:  uint32[out_dim, in_dim/8] — 8 x 4-bit values per uint32, LSB-first.
+//              Nibble k (k∈0..7) occupies bits [4k, 4k+4).
 //   scales:    uint16 (bf16)[out_dim, in_dim/32] — per-group scale, one per 32 input lanes.
-// Dequant:   w = signed_nibble * scale   (no bias)
+//
+// Signed conversion is the BIASED representation the compressed-tensors library uses:
+//     signed = unsigned - (1 << (num_bits-1))    →  unsigned [0..15] → signed [-8..+7]
+// i.e. unsigned 8 == signed 0 (NOT -8), unsigned 0 == signed -8 (NOT 0).
+// See compressed_tensors/compressors/quantized_compressors/pack_quantized.py.
+// THIS IS NOT TWO'S-COMPLEMENT. Using two's-complement flips the sign of every
+// nibble ≥ 8 (which, for trained weights that cluster near zero → unsigned ≈ 8,
+// is the majority of nibbles), producing a catastrophic DC bias in the dequant
+// output and causing the residual stream to explode at layer 2+.
+// Dequant:   w = (nibble - 8) * scale   (no zero-point)
 //
 // Same block/grid scheme as dequant_matvec_4bit_fma_vec4:
 //   blockDim = (32, ROWS_PER_BLOCK), gridDim = ceil(out_dim / ROWS_PER_BLOCK)
@@ -266,11 +275,10 @@ __global__ void dequant_matvec_sym4_g32(
             uint32_t packed = ((const uint32_t*)&packed4)[w];
             uint32_t xb = x_base + (w << 3);     // w * 8
 
-            // Sign-extend each nibble via arithmetic shift:
-            //   ((int32_t)(packed << (28 - 4k))) >> 28
+            // BIASED sign conversion: signed = unsigned - 8.
             #pragma unroll
             for (uint32_t k = 0; k < 8; k++) {
-                int32_t nib = ((int32_t)(packed << (28u - 4u*k))) >> 28;
+                int32_t nib = (int32_t)((packed >> (4u*k)) & 0xFu) - 8;
                 float sx = scale * x_shared[xb + k];
                 acc = __fmaf_rn((float)nib, sx, acc);
             }

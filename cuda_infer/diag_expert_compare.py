@@ -53,7 +53,8 @@ def compressed_tensors_dequant_sym_int4(packed_i32: np.ndarray, scale_bf16: torc
     # Unpack nibbles
     shifts = np.arange(8, dtype=np.uint32) * 4
     nib_u = (packed_i32.astype(np.uint32)[:, :, None] >> shifts) & 0xF
-    nib_s = np.where(nib_u >= 8, nib_u.astype(np.int32) - 16, nib_u.astype(np.int32))
+    # compressed-tensors sym-int4 biased rep: signed = unsigned - 8 (not two's complement)
+    nib_s = nib_u.astype(np.int32) - 8
     nib_s = nib_s.reshape(out_dim, in_dim)
     W = torch.from_numpy(nib_s).to(torch.float32)
     # Per-group scale: scale_bf16 shape [out_dim, in_dim/32]

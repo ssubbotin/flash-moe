@@ -216,21 +216,22 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
     launch_rms_norm_bf16(K->d_hidden, L.d_post_attn_layernorm, K->d_hidden_norm,
                          (uint32_t)H, K->cfg.rms_norm_eps);
 
-    if (g_kimi_debug && (layer_idx >= 1 && layer_idx <= 3)) {
+    if (g_kimi_debug && (layer_idx >= 1 && layer_idx <= 6)) {
         char tag1[32], tag2[32];
         std::snprintf(tag1, sizeof tag1, "L%d post-attn",      layer_idx);
         std::snprintf(tag2, sizeof tag2, "L%d post-attn-norm", layer_idx);
         kimi_debug_print_hidden(K->d_hidden,      H, tag1, 0, layer_idx);
         kimi_debug_print_hidden(K->d_hidden_norm, H, tag2, 0, layer_idx);
 
-        // Dump L2's post-attn-norm to disk for cross-check with python
-        if (layer_idx == 2) {
+        // Dump post-attn-norm to disk for cross-check with python
+        if (layer_idx >= 2 && layer_idx <= 6) {
             std::vector<float> buf(H);
             cudaMemcpy(buf.data(), K->d_hidden_norm, (size_t)H*4, cudaMemcpyDeviceToHost);
-            FILE* f = std::fopen("/tmp/kimi_L2_hnorm.bin", "wb");
+            char p[64]; std::snprintf(p, sizeof p, "/tmp/kimi_L%d_hnorm.bin", layer_idx);
+            FILE* f = std::fopen(p, "wb");
             std::fwrite(buf.data(), 4, H, f);
             std::fclose(f);
-            printf("[debug] dumped L2 post-attn-norm to /tmp/kimi_L2_hnorm.bin\n");
+            printf("[debug] dumped L%d post-attn-norm to %s\n", layer_idx, p);
             fflush(stdout);
         }
     }
@@ -241,7 +242,7 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
                                               K->d_hidden, (uint32_t)H);
     } else {
         // Debug breakdown for layers 1..3
-        if (g_kimi_debug && (layer_idx >= 1 && layer_idx <= 3)) {
+        if (g_kimi_debug && (layer_idx >= 1 && layer_idx <= 6)) {
             int ne = K->cfg.num_routed_experts;
             int Kexp = K->cfg.experts_per_tok;
             launch_matvec_bf16(L.d_router_gate, K->d_hidden_norm, K->d_router_logits,

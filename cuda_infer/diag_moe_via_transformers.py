@@ -47,7 +47,8 @@ def dequant_sym4_torch(packed_i32: torch.Tensor, scale_bf16: torch.Tensor) -> to
     in_dim = packed_cols * 8
     shifts = np.arange(8, dtype=np.uint32) * 4
     nib_u = (packed_np.astype(np.uint32)[:, :, None] >> shifts) & 0xF
-    nib_s = np.where(nib_u >= 8, nib_u.astype(np.int32) - 16, nib_u.astype(np.int32))
+    # compressed-tensors sym-int4 biased rep: signed = unsigned - 8 (not two's complement)
+    nib_s = nib_u.astype(np.int32) - 8
     W_int = torch.from_numpy(nib_s.reshape(out_dim, in_dim)).to(torch.float32)
     scale_f = scale_bf16.to(torch.float32).repeat_interleave(32, dim=1)
     return W_int * scale_f

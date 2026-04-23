@@ -156,8 +156,8 @@ static void cpu_sym4_matvec(
             float scale = bf16_host(sr[g]);
             uint32_t packed_v = (uint32_t)wr[c];
             for (uint32_t k = 0; k < 8; k++) {
-                int32_t raw = (int32_t)((packed_v >> (4*k)) & 0xF);
-                int32_t nib = (raw < 8) ? raw : (raw - 16);
+                // compressed-tensors biased rep: signed = unsigned - 8
+                int32_t nib = (int32_t)((packed_v >> (4*k)) & 0xFu) - 8;
                 acc += (double)nib * (double)scale * (double)x[c * 8 + k];
             }
         }
