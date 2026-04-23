@@ -195,6 +195,19 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
     int H = K->cfg.mla.H;
     int rope_half = K->cfg.mla.qk_rope_head_dim / 2;
 
+    // Dump per-layer INPUT (pre-norm hidden) for the layers we want to replay
+    // through transformers' DeepseekV3DecoderLayer. Only at pos=0 to keep this
+    // simple: a single forward is enough to compare computation.
+    if (g_kimi_debug && pos == 0 && layer_idx >= 1 && layer_idx <= 6) {
+        std::vector<float> h(H);
+        cudaMemcpy(h.data(), K->d_hidden, (size_t)H*4, cudaMemcpyDeviceToHost);
+        char p[64];
+        std::snprintf(p, sizeof p, "/tmp/kimi_L%d_input.bin", layer_idx);
+        FILE* f = std::fopen(p, "wb");
+        std::fwrite(h.data(), 4, H, f);
+        std::fclose(f);
+    }
+
     // Attention block
     cudaMemcpy(K->d_residual, K->d_hidden, (size_t)H * 4, cudaMemcpyDeviceToDevice);
     launch_rms_norm_bf16(K->d_hidden, L.d_input_layernorm, K->d_hidden_norm,
@@ -234,6 +247,17 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
             printf("[debug] dumped L%d post-attn-norm to %s\n", layer_idx, p);
             fflush(stdout);
         }
+    }
+
+    // Dump ATTN-POST-RESIDUAL output for verification of attention block
+    if (g_kimi_debug && pos == 0 && layer_idx >= 1 && layer_idx <= 6) {
+        std::vector<float> h(H);
+        cudaMemcpy(h.data(), K->d_hidden, (size_t)H*4, cudaMemcpyDeviceToHost);
+        char p[64];
+        std::snprintf(p, sizeof p, "/tmp/kimi_L%d_attnres.bin", layer_idx);
+        FILE* f = std::fopen(p, "wb");
+        std::fwrite(h.data(), 4, H, f);
+        std::fclose(f);
     }
 
     if (!L.is_moe) {
@@ -300,6 +324,17 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
             kimi_moe_layer_forward(K, L, layer_idx,
                                    K->d_hidden_norm, K->d_residual, K->d_hidden);
         }
+    }
+
+    // Dump final post-layer output
+    if (g_kimi_debug && pos == 0 && layer_idx >= 1 && layer_idx <= 6) {
+        std::vector<float> h(H);
+        cudaMemcpy(h.data(), K->d_hidden, (size_t)H*4, cudaMemcpyDeviceToHost);
+        char p[64];
+        std::snprintf(p, sizeof p, "/tmp/kimi_L%d_output.bin", layer_idx);
+        FILE* f = std::fopen(p, "wb");
+        std::fwrite(h.data(), 4, H, f);
+        std::fclose(f);
     }
 }
 
