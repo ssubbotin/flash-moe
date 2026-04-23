@@ -216,9 +216,23 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
     launch_rms_norm_bf16(K->d_hidden, L.d_post_attn_layernorm, K->d_hidden_norm,
                          (uint32_t)H, K->cfg.rms_norm_eps);
 
-    if (g_kimi_debug && layer_idx == 1) {
-        kimi_debug_print_hidden(K->d_hidden, H, "L1 post-attn", 0, layer_idx);
-        kimi_debug_print_hidden(K->d_hidden_norm, H, "L1 post-attn-norm", 0, layer_idx);
+    if (g_kimi_debug && (layer_idx >= 1 && layer_idx <= 3)) {
+        char tag1[32], tag2[32];
+        std::snprintf(tag1, sizeof tag1, "L%d post-attn",      layer_idx);
+        std::snprintf(tag2, sizeof tag2, "L%d post-attn-norm", layer_idx);
+        kimi_debug_print_hidden(K->d_hidden,      H, tag1, 0, layer_idx);
+        kimi_debug_print_hidden(K->d_hidden_norm, H, tag2, 0, layer_idx);
+
+        // Dump L2's post-attn-norm to disk for cross-check with python
+        if (layer_idx == 2) {
+            std::vector<float> buf(H);
+            cudaMemcpy(buf.data(), K->d_hidden_norm, (size_t)H*4, cudaMemcpyDeviceToHost);
+            FILE* f = std::fopen("/tmp/kimi_L2_hnorm.bin", "wb");
+            std::fwrite(buf.data(), 4, H, f);
+            std::fclose(f);
+            printf("[debug] dumped L2 post-attn-norm to /tmp/kimi_L2_hnorm.bin\n");
+            fflush(stdout);
+        }
     }
 
     if (!L.is_moe) {
@@ -226,8 +240,8 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
         residual_add<<<grid_add, block_add>>>(K->d_residual, K->d_mlp_out,
                                               K->d_hidden, (uint32_t)H);
     } else {
-        // Debug breakdown for layer 1
-        if (g_kimi_debug && layer_idx == 1) {
+        // Debug breakdown for layers 1..3
+        if (g_kimi_debug && (layer_idx >= 1 && layer_idx <= 3)) {
             int ne = K->cfg.num_routed_experts;
             int Kexp = K->cfg.experts_per_tok;
             launch_matvec_bf16(L.d_router_gate, K->d_hidden_norm, K->d_router_logits,
@@ -244,14 +258,15 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
             std::vector<float> rlogits(ne);
             cudaMemcpy(rlogits.data(), K->d_router_logits, (size_t)ne*4, cudaMemcpyDeviceToHost);
             double rsum = 0; for (float v : rlogits) rsum += v*v;
-            printf("[L1 routing] logits_L2=%.4g  topk_idx=", std::sqrt(rsum));
+            printf("[L%d routing] logits_L2=%.4g  topk_idx=", layer_idx, std::sqrt(rsum));
             for (int k = 0; k < Kexp; k++) printf("%d%s", tidx[k], k+1<Kexp?",":"");
             printf("  topk_w=");
             for (int k = 0; k < Kexp; k++) printf("%.4g%s", tw[k], k+1<Kexp?",":"");
             printf("\n"); fflush(stdout);
 
             kimi_shared_expert_forward(K, L, K->d_hidden_norm, K->d_shared_out);
-            kimi_debug_print_hidden(K->d_shared_out, H, "L1 shared_out", 0, layer_idx);
+            char stag[32]; std::snprintf(stag, sizeof stag, "L%d shared_out", layer_idx);
+            kimi_debug_print_hidden(K->d_shared_out, H, stag, 0, layer_idx);
 
             cudaMemset(K->d_moe_accum, 0, (size_t)H * 4);
             int fd = K->expert_fds[layer_idx];
@@ -265,12 +280,18 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
                 kimi_expert_forward_from_block(
                     K->d_expert_block, K->d_hidden_norm,
                     K->d_gate_tmp, K->d_up_tmp, K->d_glu_tmp, K->d_expert_out);
-                if (k == 0) kimi_debug_print_hidden(K->d_expert_out, H, "L1 expert0_out", 0, layer_idx);
+                if (k == 0) {
+                    char etag[32]; std::snprintf(etag, sizeof etag, "L%d expert0_out", layer_idx);
+                    kimi_debug_print_hidden(K->d_expert_out, H, etag, 0, layer_idx);
+                }
                 launch_kimi_weighted_accum_dw(
                     K->d_moe_accum, K->d_expert_out, K->d_topk_w + k, (uint32_t)H);
             }
-            kimi_debug_print_hidden(K->d_moe_accum, H, "L1 moe_accum", 0, layer_idx);
-            kimi_debug_print_hidden(K->d_residual,  H, "L1 residual(pre-combine)", 0, layer_idx);
+            char mtag[32], rtag[48];
+            std::snprintf(mtag, sizeof mtag, "L%d moe_accum", layer_idx);
+            std::snprintf(rtag, sizeof rtag, "L%d residual(pre-combine)", layer_idx);
+            kimi_debug_print_hidden(K->d_moe_accum, H, mtag, 0, layer_idx);
+            kimi_debug_print_hidden(K->d_residual,  H, rtag, 0, layer_idx);
 
             launch_kimi_moe_combine(K->d_residual, K->d_shared_out, K->d_moe_accum,
                                     K->d_hidden, 1.0f, (uint32_t)H);
