@@ -21,6 +21,8 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cmath>
 
 // ---------------------------------------------------------------------------
 // Small kernels: embed row copy, argmax.
@@ -78,6 +80,30 @@ __global__ void kimi_argmax_logits(
 static inline std::vector<uint8_t>& kimi_host_block() {
     static std::vector<uint8_t> b(KIMI_EXPERT_BLOCK_BYTES);
     return b;
+}
+
+// ---------------------------------------------------------------------------
+// Debug helper: copy d_hidden[0..6] to host, print with L2 norm.
+// ---------------------------------------------------------------------------
+static int g_kimi_debug = 0;  // set via env KIMI_DEBUG=1
+
+static inline void kimi_debug_print_hidden(const float* d_hidden, int H,
+                                           const char* tag, int pos, int layer_idx)
+{
+    std::vector<float> h(H);
+    cudaMemcpy(h.data(), d_hidden, (size_t)H * 4, cudaMemcpyDeviceToHost);
+    double l2 = 0.0;
+    int nan_count = 0, inf_count = 0;
+    for (int i = 0; i < H; i++) {
+        if (std::isnan(h[i])) nan_count++;
+        else if (std::isinf(h[i])) inf_count++;
+        else l2 += (double)h[i] * h[i];
+    }
+    l2 = std::sqrt(l2);
+    printf("[pos=%d L%02d %s] L2=%.4g nan=%d inf=%d first6=[%.4g %.4g %.4g %.4g %.4g %.4g]\n",
+        pos, layer_idx, tag, l2, nan_count, inf_count,
+        h[0], h[1], h[2], h[3], h[4], h[5]);
+    fflush(stdout);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,13 +216,68 @@ static inline void kimi_layer_forward(KimiModel* K, int layer_idx, int pos) {
     launch_rms_norm_bf16(K->d_hidden, L.d_post_attn_layernorm, K->d_hidden_norm,
                          (uint32_t)H, K->cfg.rms_norm_eps);
 
+    if (g_kimi_debug && layer_idx == 1) {
+        kimi_debug_print_hidden(K->d_hidden, H, "L1 post-attn", 0, layer_idx);
+        kimi_debug_print_hidden(K->d_hidden_norm, H, "L1 post-attn-norm", 0, layer_idx);
+    }
+
     if (!L.is_moe) {
         kimi_dense_mlp_forward(K, L, K->d_hidden_norm, K->d_mlp_out);
         residual_add<<<grid_add, block_add>>>(K->d_residual, K->d_mlp_out,
                                               K->d_hidden, (uint32_t)H);
     } else {
-        kimi_moe_layer_forward(K, L, layer_idx,
-                               K->d_hidden_norm, K->d_residual, K->d_hidden);
+        // Debug breakdown for layer 1
+        if (g_kimi_debug && layer_idx == 1) {
+            int ne = K->cfg.num_routed_experts;
+            int Kexp = K->cfg.experts_per_tok;
+            launch_matvec_bf16(L.d_router_gate, K->d_hidden_norm, K->d_router_logits,
+                               (uint32_t)ne, (uint32_t)H);
+            launch_kimi_moe_routing_noaux_tc(
+                K->d_router_logits, L.d_router_bias,
+                K->d_topk_idx, K->d_topk_w,
+                (uint32_t)ne, (uint32_t)Kexp,
+                K->cfg.routed_scaling_factor, K->cfg.norm_topk_prob);
+            cudaDeviceSynchronize();
+            std::vector<int> tidx(Kexp); std::vector<float> tw(Kexp);
+            cudaMemcpy(tidx.data(), K->d_topk_idx, (size_t)Kexp*4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(tw.data(),   K->d_topk_w,   (size_t)Kexp*4, cudaMemcpyDeviceToHost);
+            std::vector<float> rlogits(ne);
+            cudaMemcpy(rlogits.data(), K->d_router_logits, (size_t)ne*4, cudaMemcpyDeviceToHost);
+            double rsum = 0; for (float v : rlogits) rsum += v*v;
+            printf("[L1 routing] logits_L2=%.4g  topk_idx=", std::sqrt(rsum));
+            for (int k = 0; k < Kexp; k++) printf("%d%s", tidx[k], k+1<Kexp?",":"");
+            printf("  topk_w=");
+            for (int k = 0; k < Kexp; k++) printf("%.4g%s", tw[k], k+1<Kexp?",":"");
+            printf("\n"); fflush(stdout);
+
+            kimi_shared_expert_forward(K, L, K->d_hidden_norm, K->d_shared_out);
+            kimi_debug_print_hidden(K->d_shared_out, H, "L1 shared_out", 0, layer_idx);
+
+            cudaMemset(K->d_moe_accum, 0, (size_t)H * 4);
+            int fd = K->expert_fds[layer_idx];
+            auto& host_block = kimi_host_block();
+            for (int k = 0; k < Kexp; k++) {
+                off_t off = (off_t)tidx[k] * KIMI_EXPERT_BLOCK_BYTES;
+                ssize_t got = ::pread(fd, host_block.data(), KIMI_EXPERT_BLOCK_BYTES, off);
+                if (got != (ssize_t)KIMI_EXPERT_BLOCK_BYTES) { printf("pread short\n"); break; }
+                cudaMemcpy(K->d_expert_block, host_block.data(),
+                           KIMI_EXPERT_BLOCK_BYTES, cudaMemcpyHostToDevice);
+                kimi_expert_forward_from_block(
+                    K->d_expert_block, K->d_hidden_norm,
+                    K->d_gate_tmp, K->d_up_tmp, K->d_glu_tmp, K->d_expert_out);
+                if (k == 0) kimi_debug_print_hidden(K->d_expert_out, H, "L1 expert0_out", 0, layer_idx);
+                launch_kimi_weighted_accum_dw(
+                    K->d_moe_accum, K->d_expert_out, K->d_topk_w + k, (uint32_t)H);
+            }
+            kimi_debug_print_hidden(K->d_moe_accum, H, "L1 moe_accum", 0, layer_idx);
+            kimi_debug_print_hidden(K->d_residual,  H, "L1 residual(pre-combine)", 0, layer_idx);
+
+            launch_kimi_moe_combine(K->d_residual, K->d_shared_out, K->d_moe_accum,
+                                    K->d_hidden, 1.0f, (uint32_t)H);
+        } else {
+            kimi_moe_layer_forward(K, L, layer_idx,
+                                   K->d_hidden_norm, K->d_residual, K->d_hidden);
+        }
     }
 }
 
@@ -210,14 +291,32 @@ static inline int kimi_forward(KimiModel* K, int token, int pos) {
     kimi_embed_copy_bf16_to_f32<<<grid, block>>>(
         K->d_embed, K->d_hidden, token, (uint32_t)H);
 
+    if (g_kimi_debug) kimi_debug_print_hidden(K->d_hidden, H, "embed", pos, -1);
+
     for (int li = 0; li < K->cfg.num_layers; li++) {
         kimi_layer_forward(K, li, pos);
+        if (g_kimi_debug && (li < 8 || li % 10 == 0 || li == K->cfg.num_layers - 1))
+            kimi_debug_print_hidden(K->d_hidden, H, "post-layer", pos, li);
     }
 
     launch_rms_norm_bf16(K->d_hidden, K->d_final_norm, K->d_hidden_norm,
                          (uint32_t)H, K->cfg.rms_norm_eps);
     launch_matvec_bf16(K->d_lm_head, K->d_hidden_norm, K->d_logits,
                        (uint32_t)K->cfg.vocab_size, (uint32_t)H);
+
+    if (g_kimi_debug) {
+        std::vector<float> logits(K->cfg.vocab_size);
+        cudaMemcpy(logits.data(), K->d_logits, (size_t)K->cfg.vocab_size * 4, cudaMemcpyDeviceToHost);
+        // top-5
+        std::vector<int> idx(K->cfg.vocab_size);
+        for (int i = 0; i < K->cfg.vocab_size; i++) idx[i] = i;
+        std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+            [&](int a, int b){ return logits[a] > logits[b]; });
+        printf("[pos=%d logits top5]", pos);
+        for (int i = 0; i < 5; i++)
+            printf(" %d(%.3f)", idx[i], logits[idx[i]]);
+        printf("\n"); fflush(stdout);
+    }
 
     int* d_next;
     cudaMalloc(&d_next, sizeof(int));

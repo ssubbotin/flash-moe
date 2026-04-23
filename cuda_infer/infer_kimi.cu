@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
     auto prompt_ids = parse_tokens_csv(tokens_csv);
     if (prompt_ids.empty()) { fprintf(stderr, "no prompt tokens\n"); return 1; }
 
+    if (const char* d = std::getenv("KIMI_DEBUG")) g_kimi_debug = std::atoi(d);
+
     printf("Loading Kimi model from %s (packed %s) max_seq=%d\n",
            model_dir.c_str(), packed_dir.c_str(), max_seq);
     KimiModel K{};

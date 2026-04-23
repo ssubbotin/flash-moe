@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cinttypes>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -219,9 +220,25 @@ static inline bool kimi_read_tensor_bytes(KimiModelDir* M, const std::string& na
         fp = std::fopen(path.c_str(), "rb");
         if (!fp) { fprintf(stderr, "kimi_read: open %s\n", path.c_str()); return false; }
     }
-    std::fseek(fp, (long)t.offset, SEEK_SET);
+    // Use pread on the fileno — handles 64-bit offsets unambiguously and loops
+    // internally for large reads (single fread of >2 GB has historically had
+    // corner cases where it silently truncates).
     out.resize(t.nbytes);
-    if (std::fread(out.data(), 1, t.nbytes, fp) != t.nbytes) return false;
+    int fd = fileno(fp);
+    size_t total = 0;
+    while (total < t.nbytes) {
+        size_t want = t.nbytes - total;
+        // cap each call below INT_MAX to avoid any 32-bit truncation in the
+        // syscall wrapper on any unusual libc
+        if (want > (size_t)0x40000000) want = (size_t)0x40000000;  // 1 GiB per call
+        ssize_t got = ::pread(fd, out.data() + total, want, (off_t)(t.offset + total));
+        if (got <= 0) {
+            fprintf(stderr, "kimi_read: pread %s got=%zd after %zu/%" PRIu64 " bytes\n",
+                    name.c_str(), got, total, (uint64_t)t.nbytes);
+            return false;
+        }
+        total += (size_t)got;
+    }
     return true;
 }
 
