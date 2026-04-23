@@ -9,6 +9,7 @@
  *
  * Kernel list:
  *   1. dequant_matvec_4bit_fma  — FMA-optimized 4-bit dequant matvec
+ *   1d. dequant_matvec_sym4_g32 — Symmetric int4, group_size=32 (Kimi/compressed-tensors)
  *   2. swiglu_fused             — SiLU(gate) * up
  *   3. rms_norm                 — Fused sum-of-squares + normalize (single kernel)
  *   4. rms_norm_bf16            — RMS norm with bf16 weights
@@ -24,6 +25,10 @@
  *  14. gated_rms_norm           — RMS norm with SiLU gate and bf16 weights
  *  15. moe_combine_residual     — Weighted expert sum + shared expert + residual
  *  16. gpu_softmax_topk         — GPU-side softmax + topK for MoE routing
+ *  17. matvec_bf16              — BF16 weight @ F32 vector → F32 (Kimi attention)
+ *  18. mla_yarn_rope            — Decoupled yarn-scaled RoPE for MLA
+ *  19. mla_attn_decode          — MLA decode attention (absorbed form)
+ *  20. cast_f32_to_bf16         — Round-to-nearest-even f32 → bf16 (MLA cache fill)
  */
 
 #pragma once
@@ -202,6 +207,92 @@ __global__ void dequant_matvec_4bit_fma_vec4(
 
     acc = warp_reduce_sum(acc);
     if (lane == 0) out[row] = acc;
+}
+
+// ============================================================================
+// 1d. Symmetric int4 dequant matvec — compressed-tensors format (Kimi K2.6)
+// ============================================================================
+// Format (matches HF compressed-tensors sym-int4, group_size=32):
+//   W_packed:  uint32[out_dim, in_dim/8] — 8 signed int4 per uint32, LSB-first.
+//              Nibble k (k∈0..7) occupies bits [4k, 4k+4); each is two's-complement [-8..7].
+//   scales:    uint16 (bf16)[out_dim, in_dim/32] — per-group scale, one per 32 input lanes.
+// Dequant:   w = signed_nibble * scale   (no bias)
+//
+// Same block/grid scheme as dequant_matvec_4bit_fma_vec4:
+//   blockDim = (32, ROWS_PER_BLOCK), gridDim = ceil(out_dim / ROWS_PER_BLOCK)
+//   Shared memory: in_dim * sizeof(float)
+
+#define SYM4_GROUP_SIZE 32
+
+__global__ void dequant_matvec_sym4_g32(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const float*    __restrict__ x,
+    float*          __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    extern __shared__ float x_shared[];
+    const uint32_t lane    = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row     = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const uint32_t packed_cols = in_dim >> 3;   // in_dim / 8
+    const uint32_t num_groups  = in_dim >> 5;   // in_dim / 32
+    const uint32_t vec4_cols   = packed_cols >> 2;
+
+    // Cooperative load of x into shared memory
+    const uint32_t tid = warp_id * 32 + lane;
+    for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
+        x_shared[i] = x[i];
+    __syncthreads();
+
+    if (row >= out_dim) return;
+
+    const uint4*    w_row_v = (const uint4*)(W_packed + row * packed_cols);
+    const uint16_t* s_row   = scales + row * num_groups;
+
+    float acc = 0.0f;
+
+    // Each uint4 = 4 packed uint32 = 32 nibbles = 32 input elements, which is
+    // exactly ONE symmetric-int4 group (group_size=32). So each vec4 iteration
+    // consumes exactly one scale entry.
+    for (uint32_t vi = lane; vi < vec4_cols; vi += 32) {
+        uint4 packed4 = __ldg(w_row_v + vi);
+        uint32_t x_base = vi << 5;               // vi * 32
+        float scale = bf16_to_f32(__ldg(s_row + vi));
+
+        #pragma unroll
+        for (uint32_t w = 0; w < 4; w++) {
+            uint32_t packed = ((const uint32_t*)&packed4)[w];
+            uint32_t xb = x_base + (w << 3);     // w * 8
+
+            // Sign-extend each nibble via arithmetic shift:
+            //   ((int32_t)(packed << (28 - 4k))) >> 28
+            #pragma unroll
+            for (uint32_t k = 0; k < 8; k++) {
+                int32_t nib = ((int32_t)(packed << (28u - 4u*k))) >> 28;
+                float sx = scale * x_shared[xb + k];
+                acc = __fmaf_rn((float)nib, sx, acc);
+            }
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+// Convenience launcher — mirrors the affine launcher style used elsewhere.
+static inline void launch_dequant_matvec_sym4(
+    const uint32_t* W_packed, const uint16_t* scales,
+    const float* x, float* out,
+    uint32_t out_dim, uint32_t in_dim,
+    cudaStream_t stream = 0
+) {
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    size_t smem = in_dim * sizeof(float);
+    dequant_matvec_sym4_g32<<<grid, block, smem, stream>>>(
+        W_packed, scales, x, out, out_dim, in_dim);
 }
 
 // ============================================================================
@@ -1884,4 +1975,235 @@ static inline void launch_gpu_softmax_topk(
 ) {
     gpu_softmax_topk<<<1, 256, num_experts * sizeof(float), stream>>>(
         scores, out_indices, out_weights, num_experts, k);
+}
+
+// ============================================================================
+// 17. BF16 matvec — out[f32, out_dim] = W[bf16, out_dim, in_dim] @ x[f32, in_dim]
+// ============================================================================
+// One warp computes one output row; ROWS_PER_BLOCK warps per block.
+// Uses __ldg on x (cached in L1) rather than shared memory — keeps the kernel
+// size-agnostic (works for in_dim up to VRAM limits, not just what fits in smem).
+
+__global__ void matvec_bf16(
+    const uint16_t* __restrict__ W,       // [out_dim, in_dim] bf16
+    const float*    __restrict__ x,       // [in_dim] f32
+    float*          __restrict__ out,     // [out_dim] f32
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    const uint32_t lane    = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row     = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    if (row >= out_dim) return;
+
+    const uint16_t* w_row = W + (size_t)row * in_dim;
+    float acc = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32) {
+        acc += bf16_to_f32(__ldg(w_row + i)) * __ldg(x + i);
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+static inline void launch_matvec_bf16(
+    const uint16_t* W, const float* x, float* out,
+    uint32_t out_dim, uint32_t in_dim,
+    cudaStream_t stream = 0
+) {
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    matvec_bf16<<<grid, block, 0, stream>>>(W, x, out, out_dim, in_dim);
+}
+
+// ============================================================================
+// 18. MLA yarn-scaled RoPE
+// ============================================================================
+// Applies a single-position rotary embedding with DeepSeek yarn convention:
+//   cos, sin pre-computed on host (already multiplied by mscale factor), length dim/2.
+// Rotation uses the "pair halves" convention:
+//   out[i]        = x[i]       * cos[i] - x[i+half] * sin[i]
+//   out[i+half]   = x[i+half]  * cos[i] + x[i]      * sin[i]
+// Shape: [H heads, dim] — H = 1 for the K side (MQA rope), num_heads for Q side.
+
+__global__ void mla_yarn_rope(
+    float*       __restrict__ x,          // [num_rows, dim], f32, in-place
+    const float* __restrict__ cos_vec,    // [dim/2]
+    const float* __restrict__ sin_vec,    // [dim/2]
+    uint32_t num_rows,
+    uint32_t dim
+) {
+    uint32_t row  = blockIdx.x;
+    uint32_t half = dim / 2;
+    uint32_t i    = threadIdx.x;
+    if (row >= num_rows || i >= half) return;
+    float* xr = x + (size_t)row * dim;
+    float a = xr[i];
+    float b = xr[i + half];
+    float c = cos_vec[i];
+    float s = sin_vec[i];
+    xr[i]        = a * c - b * s;
+    xr[i + half] = b * c + a * s;
+}
+
+static inline void launch_mla_yarn_rope(
+    float* x, const float* cos_vec, const float* sin_vec,
+    uint32_t num_rows, uint32_t dim, cudaStream_t stream = 0
+) {
+    dim3 block(dim / 2);
+    dim3 grid(num_rows);
+    mla_yarn_rope<<<grid, block, 0, stream>>>(x, cos_vec, sin_vec, num_rows, dim);
+}
+
+// ============================================================================
+// 19. MLA attention decode (absorbed form)
+// ============================================================================
+// One block per head. Online softmax (numerically stable log-sum-exp) over the
+// full KV history, single token Q. KV cache is compressed:
+//   kv_cache[T, kv_lora]   = absorbed latent K/V
+//   kr_cache[T, d_rope]    = RoPE'd shared key
+// Per-token score:
+//   s[t] = q_abs[h] · kv_cache[t] + q_rope[h] · kr_cache[t]    (softmax_scale applied)
+// Output (pre W_O absorb):
+//   attn_out[h, k] = Σ_t softmax(s)[t] · kv_cache[t, k]      (k in [0..kv_lora))
+//
+// Launch: grid=(num_heads), block=(WARPS_PER_HEAD*32, 1).
+// Shared memory budget per block:
+//   q_abs_h: kv_lora * 4 bytes
+//   q_rope_h: d_rope * 4 bytes
+//   running accumulators m, l and accumulator vec (kv_lora floats)
+// For Kimi (kv_lora=512, d_rope=64), that's 512*4 + 64*4 + 512*4 + tiny = ~4.3 KB → fine.
+
+#define MLA_WARPS_PER_HEAD 4            // 128 threads per head block
+#define MLA_KV_LORA_MAX    512
+#define MLA_D_ROPE_MAX     64
+
+__global__ void mla_attn_decode(
+    const float*    __restrict__ q_abs,        // [num_heads, kv_lora]
+    const float*    __restrict__ q_rope,       // [num_heads, d_rope]
+    const uint16_t* __restrict__ kv_cache,     // [T, kv_lora] bf16
+    const uint16_t* __restrict__ kr_cache,     // [T, d_rope]  bf16
+    float*          __restrict__ attn_out,     // [num_heads, kv_lora] f32
+    uint32_t num_heads,
+    uint32_t T,
+    uint32_t kv_lora,
+    uint32_t d_rope,
+    float softmax_scale
+) {
+    const uint32_t h       = blockIdx.x;
+    const uint32_t lane    = threadIdx.x & 31;
+    const uint32_t warp_id = threadIdx.x >> 5;
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t nth     = blockDim.x;
+    if (h >= num_heads) return;
+
+    extern __shared__ float smem[];
+    float* sQa   = smem;                           // [kv_lora]
+    float* sQr   = sQa + kv_lora;                  // [d_rope]
+    float* sAcc  = sQr + d_rope;                   // [kv_lora]
+    float* sRed  = sAcc + kv_lora;                 // [WARPS_PER_HEAD] — per-warp reduction scratch
+
+    // Load Q for this head into shared memory
+    for (uint32_t i = tid; i < kv_lora; i += nth) sQa[i] = q_abs[(size_t)h * kv_lora + i];
+    for (uint32_t i = tid; i < d_rope;  i += nth) sQr[i] = q_rope[(size_t)h * d_rope + i];
+    for (uint32_t i = tid; i < kv_lora; i += nth) sAcc[i] = 0.0f;
+    __syncthreads();
+
+    // Online softmax state (kept in register, broadcast via lane 0 through shared)
+    float m_running = -INFINITY;   // running max
+    float l_running = 0.0f;        // running Σ exp(s - m)
+
+    // For each time step t, compute score then update running softmax + accumulator.
+    for (uint32_t t = 0; t < T; t++) {
+        const uint16_t* kvr = kv_cache + (size_t)t * kv_lora;
+        const uint16_t* krr = kr_cache + (size_t)t * d_rope;
+
+        // dot1 = q_abs[h] · kv_cache[t]  (kv_lora elements)
+        float dot1 = 0.0f;
+        for (uint32_t i = tid; i < kv_lora; i += nth) {
+            dot1 += sQa[i] * bf16_to_f32(__ldg(kvr + i));
+        }
+        // dot2 = q_rope[h] · kr_cache[t] (d_rope elements)
+        float dot2 = 0.0f;
+        for (uint32_t i = tid; i < d_rope; i += nth) {
+            dot2 += sQr[i] * bf16_to_f32(__ldg(krr + i));
+        }
+        float partial = dot1 + dot2;
+
+        // Reduce partial across the block (warp-reduce then cross-warp via shared)
+        partial = warp_reduce_sum(partial);
+        if (lane == 0) sRed[warp_id] = partial;
+        __syncthreads();
+        float s_t = 0.0f;
+        if (warp_id == 0) {
+            s_t = (lane < MLA_WARPS_PER_HEAD) ? sRed[lane] : 0.0f;
+            s_t = warp_reduce_sum(s_t);
+            if (lane == 0) sRed[0] = s_t * softmax_scale;
+        }
+        __syncthreads();
+        s_t = sRed[0];
+
+        // Online softmax update
+        float m_new = fmaxf(m_running, s_t);
+        float alpha = __expf(m_running - m_new);   // scale factor for old accumulator
+        float p_t   = __expf(s_t       - m_new);   // exp-weight of this token
+
+        // Scale existing accumulator and add new weighted KV
+        for (uint32_t i = tid; i < kv_lora; i += nth) {
+            float old  = sAcc[i] * alpha;
+            float kv_i = bf16_to_f32(__ldg(kvr + i));
+            sAcc[i] = old + p_t * kv_i;
+        }
+        l_running = l_running * alpha + p_t;
+        m_running = m_new;
+        __syncthreads();
+    }
+
+    // Finalize: divide accumulator by l_running
+    float inv_l = 1.0f / l_running;
+    float* out_row = attn_out + (size_t)h * kv_lora;
+    for (uint32_t i = tid; i < kv_lora; i += nth) {
+        out_row[i] = sAcc[i] * inv_l;
+    }
+}
+
+static inline void launch_mla_attn_decode(
+    const float* q_abs, const float* q_rope,
+    const uint16_t* kv_cache, const uint16_t* kr_cache,
+    float* attn_out,
+    uint32_t num_heads, uint32_t T,
+    uint32_t kv_lora, uint32_t d_rope,
+    float softmax_scale,
+    cudaStream_t stream = 0
+) {
+    dim3 block(MLA_WARPS_PER_HEAD * 32);
+    dim3 grid(num_heads);
+    size_t smem = (kv_lora + d_rope + kv_lora + MLA_WARPS_PER_HEAD) * sizeof(float);
+    mla_attn_decode<<<grid, block, smem, stream>>>(
+        q_abs, q_rope, kv_cache, kr_cache, attn_out,
+        num_heads, T, kv_lora, d_rope, softmax_scale);
+}
+
+// ============================================================================
+// 20. cast f32 → bf16 (round-to-nearest-even)
+// ============================================================================
+
+__global__ void cast_f32_to_bf16(
+    const float*    __restrict__ in,
+    uint16_t*       __restrict__ out,
+    uint32_t n
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t u = __float_as_uint(in[i]);
+    // Round-to-nearest-even bias: 0x7FFF + LSB of truncated mantissa
+    uint32_t rb = 0x00007FFFu + ((u >> 16) & 1u);
+    out[i] = (uint16_t)((u + rb) >> 16);
+}
+
+static inline void launch_cast_f32_to_bf16(
+    const float* in, uint16_t* out, uint32_t n, cudaStream_t stream = 0)
+{
+    dim3 block(256);
+    dim3 grid((n + 255) / 256);
+    cast_f32_to_bf16<<<grid, block, 0, stream>>>(in, out, n);
 }
