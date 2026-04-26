@@ -90,4 +90,53 @@ inline void launch_dequant_matvec_fp8_block128(
     dequant_matvec_fp8_block128<<<grid, block, 0, stream>>>(d_W, d_Sinv, d_x, d_y, N, K);
 }
 
+// ---------------------------------------------------------------------------
+// RMSNorm with the Qwen3.6 "delta-from-1" weight parameterization:
+//     y[i] = (1 + weight[i]) * x[i] * rsqrt(mean(x²) + eps)
+//
+// In Qwen3_5MoeRMSNorm the weight is stored as the offset from 1 (initialized
+// to zero) so the +1 is part of the formula.  This is NOT used by the gated
+// norm (Qwen3_5MoeRMSNormGated) which keeps the standard `weight * x * rsqrt`.
+// ---------------------------------------------------------------------------
+__global__ void rms_norm_bf16_plus_one(
+    const float*    __restrict__ x,
+    const uint16_t* __restrict__ weight,    // bf16, stored as (real_w - 1)
+    float*          __restrict__ out,
+    uint32_t dim, float eps)
+{
+    __shared__ float shared[32];
+    float acc = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+        acc += x[i] * x[i];
+
+    // warp reduce
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    uint32_t wid = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x & 31;
+    if (lane == 0) shared[wid] = acc;
+    __syncthreads();
+    if (wid == 0) {
+        uint32_t nw = (blockDim.x + 31) / 32;
+        acc = (lane < nw) ? shared[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        if (lane == 0) shared[0] = acc;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(shared[0] / (float)dim + eps);
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        // (1 + w) * x * rms — keep the bf16 -> f32 in f32 throughout
+        uint16_t w_bits = weight[i];
+        float w = __uint_as_float((uint32_t)w_bits << 16);
+        out[i] = (1.0f + w) * x[i] * rms;
+    }
+}
+
+inline void launch_rms_norm_bf16_plus_one(
+    const float* d_x, const uint16_t* d_w, float* d_y,
+    uint32_t dim, float eps, cudaStream_t stream = 0)
+{
+    rms_norm_bf16_plus_one<<<1, 256, 0, stream>>>(d_x, d_w, d_y, dim, eps);
+}
+
 } // namespace qwen36
