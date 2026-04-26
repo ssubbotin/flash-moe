@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <cerrno>
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -240,31 +241,77 @@ __global__ void embed_bf16_to_f32(const uint16_t* embed, int token, float* out, 
 }
 
 // ---------------------------------------------------------------------------
-// Per-layer expert streamer (just-in-time loader from FP8 safetensors)
+// Per-layer expert streamer.
+//
+// Two modes:
+//   - Packed: open packed_experts/layer_N.bin once (fixed 3.1 MB block per
+//     expert, sub-tensors at known offsets). Per call: pread one block →
+//     cudaMemcpy to a contiguous device buffer; sub-pointers index into it.
+//     One pread + one cudaMemcpy per expert (6 reads → 1).
+//   - Fallback: 6 per-tensor reads through the safetensors index.
+//
+// Packed layout (must match repack_experts_qwen36.py):
+//     0          gate_w   [512, 2048] FP8  = 1,048,576
+//     1048576    gate_s   [4, 16]     BF16 =       128
+//     1048704    up_w     [512, 2048] FP8  = 1,048,576
+//     2097280    up_s     [4, 16]     BF16 =       128
+//     2097408    down_w   [2048, 512] FP8  = 1,048,576
+//     3145984    down_s   [16, 4]     BF16 =       128
 // ---------------------------------------------------------------------------
 struct ExpertStreamer {
-    st::ModelDir* M;
-    int layer_idx;
-    // device buffers reused per call
-    uint8_t* d_gw; __nv_bfloat16* d_gs;
-    uint8_t* d_uw; __nv_bfloat16* d_us;
-    uint8_t* d_dw; __nv_bfloat16* d_ds;
-    // host scratch
-    std::vector<uint8_t> h_buf;
+    st::ModelDir* M = nullptr;
+    int layer_idx = -1;
+    int packed_fd = -1;                 // >=0 if packed file is available
+    static constexpr size_t GW_OFF = 0;
+    static constexpr size_t GW_LEN = 512 * 2048;
+    static constexpr size_t GS_OFF = GW_OFF + GW_LEN;
+    static constexpr size_t GS_LEN = 4 * 16 * 2;
+    static constexpr size_t UW_OFF = GS_OFF + GS_LEN;
+    static constexpr size_t UW_LEN = 512 * 2048;
+    static constexpr size_t US_OFF = UW_OFF + UW_LEN;
+    static constexpr size_t US_LEN = 4 * 16 * 2;
+    static constexpr size_t DW_OFF = US_OFF + US_LEN;
+    static constexpr size_t DW_LEN = 2048 * 512;
+    static constexpr size_t DS_OFF = DW_OFF + DW_LEN;
+    static constexpr size_t DS_LEN = 16 * 4 * 2;
+    static constexpr size_t EXPERT_BYTES = DS_OFF + DS_LEN;     // 3,146,112
 
-    void alloc() {
-        // gate/up: [INTER=512, H=2048] FP8 = 1 MiB; scale [4, 16] bf16 = 128 B
-        // down:    [H=2048, INTER=512] FP8 = 1 MiB; scale [16, 4] bf16 = 128 B
-        CUDA_OK(cudaMalloc(&d_gw, q36::INTER * q36::H));
-        CUDA_OK(cudaMalloc(&d_uw, q36::INTER * q36::H));
-        CUDA_OK(cudaMalloc(&d_dw, q36::H     * q36::INTER));
-        CUDA_OK(cudaMalloc(&d_gs, 4 * 16 * 2));
-        CUDA_OK(cudaMalloc(&d_us, 4 * 16 * 2));
-        CUDA_OK(cudaMalloc(&d_ds, 16 * 4 * 2));
+    // For packed mode: one big device buffer per layer; sub-pointers index in.
+    uint8_t* d_block = nullptr;
+    std::vector<uint8_t> h_block;       // page-locked would be faster but pageable works
+
+    // For fallback mode: separate device buffers (legacy path).
+    uint8_t* d_gw_fb = nullptr; __nv_bfloat16* d_gs_fb = nullptr;
+    uint8_t* d_uw_fb = nullptr; __nv_bfloat16* d_us_fb = nullptr;
+    uint8_t* d_dw_fb = nullptr; __nv_bfloat16* d_ds_fb = nullptr;
+
+    void alloc(const std::string& packed_dir) {
+        if (!packed_dir.empty()) {
+            char p[1024]; snprintf(p, sizeof(p), "%s/layer_%d.bin", packed_dir.c_str(), layer_idx);
+            packed_fd = ::open(p, O_RDONLY);
+            if (packed_fd < 0) {
+                fprintf(stderr, "[layer %d] packed file %s not present, falling back to safetensors index\n",
+                        layer_idx, p);
+            }
+        }
+        if (packed_fd >= 0) {
+            CUDA_OK(cudaMalloc(&d_block, EXPERT_BYTES));
+            h_block.resize(EXPERT_BYTES);
+        } else {
+            CUDA_OK(cudaMalloc(&d_gw_fb, GW_LEN));
+            CUDA_OK(cudaMalloc(&d_uw_fb, UW_LEN));
+            CUDA_OK(cudaMalloc(&d_dw_fb, DW_LEN));
+            CUDA_OK(cudaMalloc(&d_gs_fb, GS_LEN));
+            CUDA_OK(cudaMalloc(&d_us_fb, US_LEN));
+            CUDA_OK(cudaMalloc(&d_ds_fb, DS_LEN));
+        }
     }
     void free_() {
-        cudaFree(d_gw); cudaFree(d_uw); cudaFree(d_dw);
-        cudaFree(d_gs); cudaFree(d_us); cudaFree(d_ds);
+        if (packed_fd >= 0) { ::close(packed_fd); packed_fd = -1; cudaFree(d_block); }
+        else {
+            cudaFree(d_gw_fb); cudaFree(d_uw_fb); cudaFree(d_dw_fb);
+            cudaFree(d_gs_fb); cudaFree(d_us_fb); cudaFree(d_ds_fb);
+        }
     }
 
     void operator()(int e,
@@ -272,6 +319,23 @@ struct ExpertStreamer {
                     const uint8_t** out_uw, const __nv_bfloat16** out_us,
                     const uint8_t** out_dw, const __nv_bfloat16** out_ds)
     {
+        if (packed_fd >= 0) {
+            off_t off = (off_t)e * (off_t)EXPERT_BYTES;
+            size_t total = 0;
+            while (total < EXPERT_BYTES) {
+                ssize_t got = ::pread(packed_fd, h_block.data() + total,
+                                      EXPERT_BYTES - total, off + (off_t)total);
+                if (got <= 0) { fprintf(stderr, "pread expert l%d e%d failed: %s\n",
+                                        layer_idx, e, std::strerror(errno)); std::exit(1); }
+                total += (size_t)got;
+            }
+            CUDA_OK(cudaMemcpy(d_block, h_block.data(), EXPERT_BYTES, cudaMemcpyHostToDevice));
+            *out_gw = d_block + GW_OFF; *out_gs = (const __nv_bfloat16*)(d_block + GS_OFF);
+            *out_uw = d_block + UW_OFF; *out_us = (const __nv_bfloat16*)(d_block + US_OFF);
+            *out_dw = d_block + DW_OFF; *out_ds = (const __nv_bfloat16*)(d_block + DS_OFF);
+            return;
+        }
+        // safetensors fallback
         char buf[256];
         std::string p = q36::layer_prefix(layer_idx);
         auto load = [&](const char* sub, void* dst, size_t n_max) {
@@ -281,15 +345,15 @@ struct ExpertStreamer {
             if (v.size() > n_max) { fprintf(stderr, "expert tensor %s too big\n", buf); std::exit(1); }
             CUDA_OK(cudaMemcpy(dst, v.data(), v.size(), cudaMemcpyHostToDevice));
         };
-        load("gate_proj.weight",           d_gw, q36::INTER * q36::H);
-        load("gate_proj.weight_scale_inv", d_gs, 4 * 16 * 2);
-        load("up_proj.weight",             d_uw, q36::INTER * q36::H);
-        load("up_proj.weight_scale_inv",   d_us, 4 * 16 * 2);
-        load("down_proj.weight",           d_dw, q36::H * q36::INTER);
-        load("down_proj.weight_scale_inv", d_ds, 16 * 4 * 2);
-        *out_gw = d_gw; *out_gs = d_gs;
-        *out_uw = d_uw; *out_us = d_us;
-        *out_dw = d_dw; *out_ds = d_ds;
+        load("gate_proj.weight",           d_gw_fb, GW_LEN);
+        load("gate_proj.weight_scale_inv", d_gs_fb, GS_LEN);
+        load("up_proj.weight",             d_uw_fb, UW_LEN);
+        load("up_proj.weight_scale_inv",   d_us_fb, US_LEN);
+        load("down_proj.weight",           d_dw_fb, DW_LEN);
+        load("down_proj.weight_scale_inv", d_ds_fb, DS_LEN);
+        *out_gw = d_gw_fb; *out_gs = d_gs_fb;
+        *out_uw = d_uw_fb; *out_us = d_us_fb;
+        *out_dw = d_dw_fb; *out_ds = d_ds_fb;
     }
 };
 
@@ -326,9 +390,11 @@ struct Model {
     float* d_logits;
 
     std::vector<ExpertStreamer> streamers;    // one per layer (different layer_idx each)
+    std::string packed_dir;
 };
 
-static void load_model(Model* G, const std::string& model_dir, uint32_t max_seq) {
+static void load_model(Model* G, const std::string& model_dir, uint32_t max_seq,
+                       const std::string& packed_dir) {
     if (!st::open(&G->M, model_dir)) std::exit(1);
 
     fprintf(stderr, "loading globals: embed, lm_head, final_norm...\n");
@@ -384,11 +450,12 @@ static void load_model(Model* G, const std::string& model_dir, uint32_t max_seq)
     CUDA_OK(cudaMalloc(&G->d_logits, q36::VOCAB * 4));
 
     // Expert streamers (one per layer; share `M` index)
+    G->packed_dir = packed_dir;
     G->streamers.resize(q36::NUM_LAYERS);
     for (uint32_t li = 0; li < q36::NUM_LAYERS; li++) {
         G->streamers[li].M = &G->M;
         G->streamers[li].layer_idx = (int)li;
-        G->streamers[li].alloc();
+        G->streamers[li].alloc(packed_dir);
     }
     fprintf(stderr, "model loaded.\n");
 }
@@ -446,7 +513,7 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
-    std::string model_dir;
+    std::string model_dir, packed_dir;
     std::string tokens_csv, prompt_text;
     std::vector<std::pair<std::string,std::string>> chat_msgs;
     int max_tokens = 64, max_seq = 2048;
@@ -455,6 +522,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "--model-dir"  && i + 1 < argc) model_dir = argv[++i];
+        else if (a == "--packed-dir" && i + 1 < argc) packed_dir = argv[++i];
         else if (a == "--tokens"     && i + 1 < argc) tokens_csv = argv[++i];
         else if (a == "--prompt"     && i + 1 < argc) prompt_text = argv[++i];
         else if (a == "--chat") {
@@ -494,7 +562,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "prompt: %zu tokens\n", prompt_ids.size());
 
     Model G{};
-    load_model(&G, model_dir, (uint32_t)max_seq);
+    load_model(&G, model_dir, (uint32_t)max_seq, packed_dir);
 
     std::mt19937 rng((uint32_t)(seed ^ (seed >> 32)));
 
