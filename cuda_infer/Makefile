@@ -1,7 +1,8 @@
-NVCC = /usr/local/cuda-12.8/bin/nvcc
+CUDA_HOME ?= $(firstword $(wildcard /usr/local/cuda-12.8 /usr/local/cuda))
+NVCC = $(CUDA_HOME)/bin/nvcc
 CFLAGS = -O2 -Wno-deprecated-gpu-targets
-CUDA_LIB = /usr/local/cuda-12.8/targets/x86_64-linux/lib
-CUDA_INC = /usr/local/cuda-12.8/targets/x86_64-linux/include
+CUDA_LIB = $(CUDA_HOME)/targets/x86_64-linux/lib
+CUDA_INC = $(CUDA_HOME)/targets/x86_64-linux/include
 LDFLAGS = -lpthread -L$(CUDA_LIB) -lcufile -lcublas -lcublasLt
 
 KIMI_HEADERS = kimi_loader.cuh kimi_forward.cuh kimi_moe.cuh mla_forward.cuh kernels.cuh
@@ -19,7 +20,10 @@ $(TARGET): infer.cu kernels.cuh ../metal_infer/tokenizer.h tokenizer_impl.o
 infer_kimi: infer_kimi.cu $(KIMI_HEADERS)
 	$(NVCC) $(KIMI_CFLAGS) -o infer_kimi infer_kimi.cu $(KIMI_LDFLAGS)
 
+test_fp8_block: test_fp8_block.cu qwen36_kernels.cuh safetensors_io.cuh
+	$(NVCC) $(CFLAGS) -o test_fp8_block test_fp8_block.cu -lpthread
+
 clean:
-	rm -f $(TARGET) infer_kimi
+	rm -f $(TARGET) infer_kimi test_fp8_block
 
 .PHONY: clean
