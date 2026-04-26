@@ -214,6 +214,58 @@ inline void run_linear_attn(const LinearAttnW& L, uint32_t SEQ,
     }
 }
 
+// Single-token (decode-style) forward through a linear-attention block.
+// `pos` is unused — the recurrence state in S advances implicitly per call.
+// Caller is responsible for resetting S at the start of a new sequence.
+inline void run_linear_attn_step(const LinearAttnW& L,
+                                 const float* d_x_in, float* d_resid_out,
+                                 LinearAttnScratch* S)
+{
+    const float Q_SCALE = 1.0f / std::sqrt((float)LIN_HEAD);
+
+    qwen36::launch_rms_norm_bf16_plus_one(d_x_in, L.in_ln_w, S->d_h, H, RMS_EPS);
+    qwen36::launch_dequant_matvec_fp8_block128(L.qkv_w, L.qkv_s, S->d_h, S->d_qkv_pre, QKV_DIM, H);
+
+    dim3 cb(256), cg((QKV_DIM + 255) / 256);
+    conv1d_step<<<cg, cb>>>(S->d_conv_state, S->d_qkv_pre, L.conv_w, S->d_qkv_post, QKV_DIM);
+
+    qwen36::launch_dequant_matvec_fp8_block128(L.z_w, L.z_s, S->d_h, S->d_z, Z_DIM, H);
+    launch_matvec_bf16(L.a_w, S->d_h, S->d_a, LIN_NV, H);
+    launch_matvec_bf16(L.b_w, S->d_h, S->d_b, LIN_NV, H);
+    compute_decay_beta<<<1, LIN_NV>>>(S->d_a, S->d_b, L.A_log, L.dt_bias, S->d_g, S->d_beta);
+
+    CUDA_OK(cudaMemcpy2D(S->d_q_rep,                 2 * LIN_HEAD * 4,
+                         S->d_qkv_post,                  LIN_HEAD * 4,
+                         LIN_HEAD * 4, LIN_NK, cudaMemcpyDeviceToDevice));
+    CUDA_OK(cudaMemcpy2D(S->d_q_rep + LIN_HEAD,      2 * LIN_HEAD * 4,
+                         S->d_qkv_post,                  LIN_HEAD * 4,
+                         LIN_HEAD * 4, LIN_NK, cudaMemcpyDeviceToDevice));
+    CUDA_OK(cudaMemcpy2D(S->d_k_rep,                 2 * LIN_HEAD * 4,
+                         S->d_qkv_post + LIN_KEY_TOT, LIN_HEAD * 4,
+                         LIN_HEAD * 4, LIN_NK, cudaMemcpyDeviceToDevice));
+    CUDA_OK(cudaMemcpy2D(S->d_k_rep + LIN_HEAD,      2 * LIN_HEAD * 4,
+                         S->d_qkv_post + LIN_KEY_TOT, LIN_HEAD * 4,
+                         LIN_HEAD * 4, LIN_NK, cudaMemcpyDeviceToDevice));
+    CUDA_OK(cudaMemcpyAsync(S->d_v_full, S->d_qkv_post + 2 * LIN_KEY_TOT,
+                            LIN_VAL_TOT * 4, cudaMemcpyDeviceToDevice));
+
+    l2_norm_qk<<<LIN_NV, LIN_HEAD>>>(S->d_q_rep, S->d_k_rep, LIN_HEAD);
+    vec_scale<<<(LIN_VAL_TOT + 255) / 256, 256>>>(S->d_q_rep, Q_SCALE, LIN_VAL_TOT);
+
+    gated_delta_net_step<<<LIN_NV, LIN_HEAD>>>(
+        S->d_delta_state, S->d_q_rep, S->d_k_rep, S->d_v_full,
+        S->d_g, S->d_beta, S->d_core, /*kpv=*/1);
+    gated_rms_norm<<<LIN_NV, LIN_HEAD>>>(S->d_core, S->d_z, L.norm_w, S->d_norm_out, LIN_HEAD, RMS_EPS);
+    qwen36::launch_dequant_matvec_fp8_block128(L.out_w, L.out_s, S->d_norm_out, S->d_attn, H, LIN_VAL_TOT);
+
+    launch_residual_add(d_x_in, S->d_attn, d_resid_out, H);
+}
+
+inline void reset_linear_attn_state(LinearAttnScratch* S) {
+    CUDA_OK(cudaMemset(S->d_conv_state,  0, 3 * QKV_DIM * 4));
+    CUDA_OK(cudaMemset(S->d_delta_state, 0, LIN_NV * LIN_HEAD * LIN_HEAD * 4));
+}
+
 // ---------- full-attention bundle ----------
 struct FullAttnW {
     uint16_t *in_ln_w  = nullptr;
@@ -344,6 +396,67 @@ inline void run_full_attn(const FullAttnW& F, uint32_t SEQ,
     }
 }
 
+// Single-token decode forward through full attention.
+//   - Updates K/V cache at position `pos`
+//   - Attends to positions [0, pos] inclusive
+//   - max_seq is the allocation size of d_K_cache / d_V_cache
+inline void run_full_attn_step(const FullAttnW& F,
+                               const float* d_x_in, float* d_resid_out,
+                               FullAttnScratch* S, uint32_t pos, uint32_t max_seq)
+{
+    const float SCALE = 1.0f / std::sqrt((float)FA_HEAD_D);
+
+    qwen36::launch_rms_norm_bf16_plus_one(d_x_in, F.in_ln_w, S->d_h, H, RMS_EPS);
+
+    qwen36::launch_dequant_matvec_fp8_block128(F.q_w, F.q_s, S->d_h, S->d_q_full, FA_Q_RAW_DIM, H);
+    qwen36::launch_dequant_matvec_fp8_block128(F.k_w, F.k_s, S->d_h, S->d_k_full, FA_KV_DIM,    H);
+    qwen36::launch_dequant_matvec_fp8_block128(F.v_w, F.v_s, S->d_h, S->d_v_full, FA_KV_DIM,    H);
+
+    CUDA_OK(cudaMemcpy2D(S->d_Q,                  FA_HEAD_D * 4,
+                         S->d_q_full,             FA_HEAD_D * 2 * 4,
+                         FA_HEAD_D * 4, FA_NQ, cudaMemcpyDeviceToDevice));
+    CUDA_OK(cudaMemcpy2D(S->d_GATE,               FA_HEAD_D * 4,
+                         S->d_q_full + FA_HEAD_D, FA_HEAD_D * 2 * 4,
+                         FA_HEAD_D * 4, FA_NQ, cudaMemcpyDeviceToDevice));
+
+    qwen36::launch_rms_norm_per_row_plus_one(S->d_Q,      F.q_norm_w, S->d_Q,      FA_NQ,  FA_HEAD_D, RMS_EPS);
+    qwen36::launch_rms_norm_per_row_plus_one(S->d_k_full, F.k_norm_w, S->d_K_norm, FA_NKV, FA_HEAD_D, RMS_EPS);
+
+    const float* d_cos_t = S->d_cos + (size_t)pos * ROPE_HALF;
+    const float* d_sin_t = S->d_sin + (size_t)pos * ROPE_HALF;
+    qwen36::launch_rope_partial_inplace(S->d_Q,      d_cos_t, d_sin_t, FA_NQ,  FA_HEAD_D, ROPE_DIM);
+    qwen36::launch_rope_partial_inplace(S->d_K_norm, d_cos_t, d_sin_t, FA_NKV, FA_HEAD_D, ROPE_DIM);
+
+    // Write K/V into cache at `pos`
+    CUDA_OK(cudaMemcpyAsync(S->d_K_cache + (size_t)pos * FA_KV_DIM, S->d_K_norm,  FA_KV_DIM * 4, cudaMemcpyDeviceToDevice));
+    CUDA_OK(cudaMemcpyAsync(S->d_V_cache + (size_t)pos * FA_KV_DIM, S->d_v_full,  FA_KV_DIM * 4, cudaMemcpyDeviceToDevice));
+
+    // Causal attention over positions 0..pos
+    const uint32_t L = pos + 1;
+    {
+        dim3 grid(FA_NQ * L), block(256);
+        attn_scores<<<grid, block>>>(S->d_Q, S->d_K_cache, S->d_scores,
+                                     FA_HEAD_D, FA_KV_DIM, L, max_seq,
+                                     SCALE, FA_HPK, L);
+    }
+    attn_softmax<<<FA_NQ, 256>>>(S->d_scores, L, max_seq);
+    {
+        dim3 block(256), grid((FA_Q_DIM + 255) / 256);
+        attn_values<<<grid, block>>>(S->d_scores, S->d_V_cache, S->d_attn_per_head,
+                                     FA_HEAD_D, FA_KV_DIM, L, max_seq, FA_HPK);
+    }
+    {
+        dim3 block(256), grid((FA_Q_DIM + 255) / 256);
+        sigmoid_gate<<<grid, block>>>(S->d_attn_per_head, S->d_GATE, FA_Q_DIM);
+    }
+    qwen36::launch_dequant_matvec_fp8_block128(F.o_w, F.o_s, S->d_attn_per_head, S->d_attn_out, H, FA_Q_DIM);
+    launch_residual_add(d_x_in, S->d_attn_out, d_resid_out, H);
+}
+
+// In step mode the K/V cache is the only persistent state — but it grows
+// monotonically with position, so a "reset" just means the next call starts
+// writing at pos=0; no explicit clear needed.
+
 // ---------- MoE bundle ----------
 struct ExpertW {
     uint8_t* gate_w = nullptr; __nv_bfloat16* gate_s = nullptr;
@@ -412,6 +525,65 @@ inline void alloc_moe_scratch(MoEScratch* S) {
     CUDA_OK(cudaMalloc(&S->d_shared_out,        H * 4));
     CUDA_OK(cudaMalloc(&S->d_shared_gate_logit, 4));
     CUDA_OK(cudaMalloc(&S->d_mlp_out,           H * 4));
+}
+
+// Per-token MoE step. Caller plugs in `expert_loader(idx, &gate, &up, &down,
+// &gs, &us, &ds)` which streams expert `idx`'s FP8 weights into device buffers
+// and returns pointers usable by the FP8 matvec; this lets the driver decide
+// whether experts come from VRAM, host RAM, SSD, etc.
+template <class ExpertLoader>
+inline void run_moe_step(const MoEW& X, const float* d_x_in, float* d_layer_out,
+                         MoEScratch* S, ExpertLoader load_expert)
+{
+    qwen36::launch_rms_norm_bf16_plus_one(d_x_in, X.post_ln_w, S->d_h, H, RMS_EPS);
+    launch_matvec_bf16(X.router_w, S->d_h, S->d_router_logits, N_EXPERTS, H);
+
+    std::vector<float> logits(N_EXPERTS);
+    CUDA_OK(cudaMemcpy(logits.data(), S->d_router_logits, N_EXPERTS * 4, cudaMemcpyDeviceToHost));
+    float lmax = *std::max_element(logits.begin(), logits.end());
+    std::vector<double> probs(N_EXPERTS); double psum = 0;
+    for (uint32_t i = 0; i < N_EXPERTS; i++) { probs[i] = std::exp((double)logits[i] - lmax); psum += probs[i]; }
+    for (uint32_t i = 0; i < N_EXPERTS; i++) probs[i] /= psum;
+    std::vector<int> idx(N_EXPERTS);
+    for (uint32_t i = 0; i < N_EXPERTS; i++) idx[i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + TOP_K, idx.end(),
+                      [&](int a, int b){ return probs[a] > probs[b]; });
+    std::vector<int>   topk_idx(TOP_K);
+    std::vector<float> topk_w(TOP_K);
+    double wsum = 0;
+    for (uint32_t k = 0; k < TOP_K; k++) { topk_idx[k] = idx[k]; topk_w[k] = (float)probs[idx[k]]; wsum += topk_w[k]; }
+    for (uint32_t k = 0; k < TOP_K; k++) topk_w[k] = (float)((double)topk_w[k] / wsum);
+
+    CUDA_OK(cudaMemset(S->d_expert_sum, 0, H * 4));
+    for (uint32_t k = 0; k < TOP_K; k++) {
+        int e = topk_idx[k];
+        const uint8_t* gw; const __nv_bfloat16* gs;
+        const uint8_t* uw; const __nv_bfloat16* us;
+        const uint8_t* dw; const __nv_bfloat16* ds;
+        load_expert(e, &gw, &gs, &uw, &us, &dw, &ds);
+        qwen36::launch_dequant_matvec_fp8_block128(gw, gs, S->d_h, S->d_gate_pre, INTER, H);
+        qwen36::launch_dequant_matvec_fp8_block128(uw, us, S->d_h, S->d_up_pre,   INTER, H);
+        launch_swiglu(S->d_gate_pre, S->d_up_pre, S->d_hidden_e, INTER);
+        qwen36::launch_dequant_matvec_fp8_block128(dw, ds, S->d_hidden_e, S->d_down_e, H, INTER);
+        int B = 256, G = (H + B - 1) / B;
+        vec_scale<<<G, B>>>(S->d_down_e, topk_w[k], H);
+        launch_residual_add(S->d_expert_sum, S->d_down_e, S->d_expert_sum, H);
+    }
+
+    qwen36::launch_dequant_matvec_fp8_block128(X.shared.gate_w, X.shared.gate_s, S->d_h, S->d_gate_pre, INTER, H);
+    qwen36::launch_dequant_matvec_fp8_block128(X.shared.up_w,   X.shared.up_s,   S->d_h, S->d_up_pre,   INTER, H);
+    launch_swiglu(S->d_gate_pre, S->d_up_pre, S->d_hidden_e, INTER);
+    qwen36::launch_dequant_matvec_fp8_block128(X.shared.down_w, X.shared.down_s, S->d_hidden_e, S->d_shared_out, H, INTER);
+
+    launch_matvec_bf16(X.shared_gate_w, S->d_h, S->d_shared_gate_logit, 1, H);
+    float h_logit = 0;
+    CUDA_OK(cudaMemcpy(&h_logit, S->d_shared_gate_logit, 4, cudaMemcpyDeviceToHost));
+    float h_sig = 1.0f / (1.0f + std::exp(-h_logit));
+    int B = 256, G = (H + B - 1) / B;
+    vec_scale<<<G, B>>>(S->d_shared_out, h_sig, H);
+
+    launch_residual_add(S->d_expert_sum, S->d_shared_out, S->d_mlp_out, H);
+    launch_residual_add(d_x_in, S->d_mlp_out, d_layer_out, H);
 }
 
 inline void run_moe(const MoEW& X, uint32_t SEQ,
