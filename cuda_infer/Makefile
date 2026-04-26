@@ -32,7 +32,10 @@ test_qwen36_moe: test_qwen36_moe.cu qwen36_kernels.cuh safetensors_io.cuh kernel
 test_qwen36_full_attn: test_qwen36_full_attn.cu qwen36_kernels.cuh safetensors_io.cuh kernels.cuh
 	$(NVCC) $(CFLAGS) -arch=sm_89 -o test_qwen36_full_attn test_qwen36_full_attn.cu -lpthread
 
+test_qwen36_layer: test_qwen36_layer.cu qwen36_kernels.cuh safetensors_io.cuh kernels.cuh
+	$(NVCC) $(CFLAGS) -arch=sm_89 -o test_qwen36_layer test_qwen36_layer.cu -lpthread
+
 clean:
-	rm -f $(TARGET) infer_kimi test_fp8_block test_qwen36_linear_attn test_qwen36_moe test_qwen36_full_attn
+	rm -f $(TARGET) infer_kimi test_fp8_block test_qwen36_linear_attn test_qwen36_moe test_qwen36_full_attn test_qwen36_layer
 
 .PHONY: clean
