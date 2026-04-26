@@ -38,7 +38,7 @@ test_qwen36_layer: test_qwen36_layer.cu qwen36_kernels.cuh safetensors_io.cuh ke
 test_qwen36_chain: test_qwen36_chain.cu qwen36_kernels.cuh qwen36_layer_runner.cuh safetensors_io.cuh kernels.cuh
 	$(NVCC) $(CFLAGS) -arch=sm_89 -o test_qwen36_chain test_qwen36_chain.cu -lpthread
 
-infer_qwen36: infer_qwen36.cu qwen36_kernels.cuh qwen36_layer_runner.cuh safetensors_io.cuh kernels.cuh
+infer_qwen36: infer_qwen36.cu qwen36_kernels.cuh qwen36_layer_runner.cuh qwen36_expert_cache.cuh safetensors_io.cuh kernels.cuh
 	$(NVCC) $(CFLAGS) -arch=sm_89 -o infer_qwen36 infer_qwen36.cu -lpthread
 
 clean:

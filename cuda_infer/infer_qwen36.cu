@@ -37,6 +37,7 @@
 
 #include "safetensors_io.cuh"
 #include "qwen36_layer_runner.cuh"
+#include "qwen36_expert_cache.cuh"
 
 #ifndef CUDA_OK
 #define CUDA_OK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
@@ -391,10 +392,18 @@ struct Model {
 
     std::vector<ExpertStreamer> streamers;    // one per layer (different layer_idx each)
     std::string packed_dir;
+
+    // Optional shared LRU cache across all layers. When `cache.use` is true,
+    // layer streamers ignore their own buffers and the cache services every
+    // (layer, expert) request through one big VRAM pool.
+    struct {
+        bool use = false;
+        q36::ExpertCache impl;
+    } cache;
 };
 
 static void load_model(Model* G, const std::string& model_dir, uint32_t max_seq,
-                       const std::string& packed_dir) {
+                       const std::string& packed_dir, uint32_t cache_experts) {
     if (!st::open(&G->M, model_dir)) std::exit(1);
 
     fprintf(stderr, "loading globals: embed, lm_head, final_norm...\n");
@@ -449,13 +458,20 @@ static void load_model(Model* G, const std::string& model_dir, uint32_t max_seq,
     CUDA_OK(cudaMalloc(&G->d_h_norm, q36::H * 4));
     CUDA_OK(cudaMalloc(&G->d_logits, q36::VOCAB * 4));
 
-    // Expert streamers (one per layer; share `M` index)
+    // Expert sourcing.  Two modes:
+    //   --cache-experts > 0 + packed-dir  → shared LRU cache in VRAM
+    //   else                              → per-layer streamer (1 expert at a time)
     G->packed_dir = packed_dir;
-    G->streamers.resize(q36::NUM_LAYERS);
-    for (uint32_t li = 0; li < q36::NUM_LAYERS; li++) {
-        G->streamers[li].M = &G->M;
-        G->streamers[li].layer_idx = (int)li;
-        G->streamers[li].alloc(packed_dir);
+    if (cache_experts > 0 && !packed_dir.empty()) {
+        G->cache.use = true;
+        if (!G->cache.impl.init(cache_experts, packed_dir, q36::NUM_LAYERS)) std::exit(1);
+    } else {
+        G->streamers.resize(q36::NUM_LAYERS);
+        for (uint32_t li = 0; li < q36::NUM_LAYERS; li++) {
+            G->streamers[li].M = &G->M;
+            G->streamers[li].layer_idx = (int)li;
+            G->streamers[li].alloc(packed_dir);
+        }
     }
     fprintf(stderr, "model loaded.\n");
 }
@@ -488,8 +504,21 @@ static void forward_one(Model* G, int token, uint32_t pos, uint32_t max_seq,
             q36::run_linear_attn_step(G->lin_attn[li], G->d_h_in, G->d_resid1, &G->Lscratch);
         }
 
-        // MoE substep, with experts streamed from disk
-        q36::run_moe_step(G->moe[li], G->d_resid1, G->d_h_out, &G->Mscratch, G->streamers[li]);
+        // MoE substep — experts come from the shared LRU cache or the
+        // per-layer streamer depending on configuration.
+        if (G->cache.use) {
+            uint32_t L_layer = li;
+            q36::run_moe_step(G->moe[li], G->d_resid1, G->d_h_out, &G->Mscratch,
+                [&](int e,
+                    const uint8_t** gw, const __nv_bfloat16** gs,
+                    const uint8_t** uw, const __nv_bfloat16** us,
+                    const uint8_t** dw, const __nv_bfloat16** ds) {
+                    uint8_t* d_block = G->cache.impl.get(L_layer, (uint32_t)e);
+                    G->cache.impl.unpack(d_block, gw, gs, uw, us, dw, ds);
+                });
+        } else {
+            q36::run_moe_step(G->moe[li], G->d_resid1, G->d_h_out, &G->Mscratch, G->streamers[li]);
+        }
 
         // swap hidden buffers for next layer
         std::swap(G->d_h_in, G->d_h_out);
@@ -517,6 +546,7 @@ int main(int argc, char** argv) {
     std::string tokens_csv, prompt_text;
     std::vector<std::pair<std::string,std::string>> chat_msgs;
     int max_tokens = 64, max_seq = 2048;
+    int cache_experts = 0;        // 0 = disabled (per-layer streamer)
     SampleCfg samp{}; uint64_t seed = (uint64_t)time(nullptr);
 
     for (int i = 1; i < argc; i++) {
@@ -530,8 +560,9 @@ int main(int argc, char** argv) {
                 chat_msgs.push_back({argv[i+1], argv[i+2]}); i += 2;
             }
         }
-        else if (a == "--max-tokens" && i + 1 < argc) max_tokens = std::atoi(argv[++i]);
-        else if (a == "--max-seq"    && i + 1 < argc) max_seq    = std::atoi(argv[++i]);
+        else if (a == "--max-tokens"    && i + 1 < argc) max_tokens    = std::atoi(argv[++i]);
+        else if (a == "--max-seq"       && i + 1 < argc) max_seq       = std::atoi(argv[++i]);
+        else if (a == "--cache-experts" && i + 1 < argc) cache_experts = std::atoi(argv[++i]);
         else if (a == "--greedy")                     samp.greedy = true;
         else if (a == "--temp"       && i + 1 < argc) samp.temp   = (float)std::atof(argv[++i]);
         else if (a == "--top-p"      && i + 1 < argc) samp.top_p  = (float)std::atof(argv[++i]);
@@ -562,7 +593,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "prompt: %zu tokens\n", prompt_ids.size());
 
     Model G{};
-    load_model(&G, model_dir, (uint32_t)max_seq, packed_dir);
+    load_model(&G, model_dir, (uint32_t)max_seq, packed_dir, (uint32_t)cache_experts);
 
     std::mt19937 rng((uint32_t)(seed ^ (seed >> 32)));
 
@@ -604,6 +635,7 @@ int main(int argc, char** argv) {
     }
     printf("\n");
 
+    if (G.cache.use) G.cache.impl.print_stats("end-of-run");
     if (need_tok) tok_close(&tok);
     return 0;
 }
