@@ -37,7 +37,6 @@ PROMPTS = [
     ("france",       "The capital of France is"),
     ("math",         "2 + 2 ="),
     ("code",         "def fibonacci(n):"),
-    ("chat_simple",  None),    # filled in via apply_chat_template below
 ]
 
 def load_model_and_tok():
@@ -111,45 +110,83 @@ def dump():
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2, default=str))
     print(f"saved config to {out_dir/'config.json'}")
 
-    # build prompts
     prompts = []
     for tag, text in PROMPTS:
-        if text is None:
-            msgs = [{"role": "user", "content": "What is 2+2?"}]
-            ids = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
-            prompts.append((tag, "<chat: user/What is 2+2?>", ids))
-        else:
-            ids = tok.encode(text, add_special_tokens=False)
-            prompts.append((tag, text, ids))
+        ids = tok.encode(text, add_special_tokens=False)
+        prompts.append((tag, text, ids))
 
     # capture buffers populated by hooks: capture[layer_idx]['input'] etc.
     capture = [{} for _ in range(len(layers))]
     hooks = []
 
-    # input_layernorm pre-hook captures the layer's input
-    # post_attention_layernorm pre-hook captures the post-attn residual
-    # mlp forward hook captures the moe output (before residual add)
-    for li, L in enumerate(layers):
-        def mk_pre_input(idx):
+    # ---- factories: each closure binds the layer index ----
+    def mk_pre(name):
+        def factory(idx):
             def h(_m, inp):
-                capture[idx]['input'] = to_np(inp[0])
+                capture[idx][name] = to_np(inp[0])
             return h
-        def mk_pre_postattn(idx):
-            def h(_m, inp):
-                capture[idx]['post_attn_resid'] = to_np(inp[0])
-            return h
-        def mk_post_mlp(idx):
+        return factory
+    def mk_post(name):
+        def factory(idx):
             def h(_m, _inp, out):
-                capture[idx]['mlp_out'] = to_np(out)
+                capture[idx][name] = to_np(out)
             return h
+        return factory
+
+    pre_input        = mk_pre('input')
+    pre_postattn     = mk_pre('post_attn_resid')
+    post_mlp         = mk_post('mlp_out')
+    post_h_norm      = mk_post('h_norm')          # input_layernorm output
+    post_qkv_pre     = mk_post('qkv_pre_conv')    # in_proj_qkv output (pre conv)
+    post_qkv_conv    = mk_post('qkv_post_conv')   # conv1d output (pre SiLU; conv stores pre-act)
+    post_z           = mk_post('z')               # in_proj_z output
+    post_a_raw       = mk_post('a_raw')           # in_proj_a output (alpha logits)
+    post_b_raw       = mk_post('b_raw')           # in_proj_b output (beta logits)
+    pre_norm_gated   = mk_pre('core_attn_out')    # input to norm (= delta-rule output)
+    post_norm_gated  = mk_post('gated_norm_out')  # norm output (post RMSNormGated)
+    post_outproj     = mk_post('attn_out')        # out_proj output (= linear_attn output before residual)
+    post_attn_block  = mk_post('attn_block_out')  # whole linear_attn / self_attn module output
+
+    for li, L in enumerate(layers):
         if hasattr(L, "input_layernorm"):
-            hooks.append(L.input_layernorm.register_forward_pre_hook(mk_pre_input(li)))
+            hooks.append(L.input_layernorm.register_forward_pre_hook(pre_input(li)))
+            hooks.append(L.input_layernorm.register_forward_hook(post_h_norm(li)))
         if hasattr(L, "post_attention_layernorm"):
-            hooks.append(L.post_attention_layernorm.register_forward_pre_hook(mk_pre_postattn(li)))
+            hooks.append(L.post_attention_layernorm.register_forward_pre_hook(pre_postattn(li)))
         # mlp on Qwen3-Moe is the MoE block; for non-Moe it's the MLP
         mlp = getattr(L, "mlp", None) or getattr(L, "block_sparse_moe", None) or getattr(L, "moe", None)
         if mlp is not None:
-            hooks.append(mlp.register_forward_hook(mk_post_mlp(li)))
+            hooks.append(mlp.register_forward_hook(post_mlp(li)))
+
+        # Per-layer attention: either GatedDeltaNet (linear_attn) or full attention (self_attn).
+        attn = getattr(L, "linear_attn", None)
+        if attn is not None:
+            hooks.append(attn.register_forward_hook(post_attn_block(li)))
+            for sub_name, key_name in (("in_proj_qkv","qkv_pre_conv"),
+                                       ("in_proj_z",  "z"),
+                                       ("in_proj_a",  "a_raw"),
+                                       ("in_proj_b",  "b_raw"),
+                                       ("conv1d",     "qkv_post_conv"),
+                                       ("out_proj",   "attn_out")):
+                sub = getattr(attn, sub_name, None)
+                if sub is not None:
+                    hooks.append(sub.register_forward_hook(mk_post(key_name)(li)))
+            # norm (RMSNormGated): hook input AND output
+            sub = getattr(attn, "norm", None)
+            if sub is not None:
+                hooks.append(sub.register_forward_pre_hook(pre_norm_gated(li)))
+                hooks.append(sub.register_forward_hook(post_norm_gated(li)))
+        else:
+            sa = getattr(L, "self_attn", None)
+            if sa is not None:
+                hooks.append(sa.register_forward_hook(post_attn_block(li)))
+                for sub_name, key_name in (("q_proj","q_proj_out"),
+                                           ("k_proj","k_proj_out"),
+                                           ("v_proj","v_proj_out"),
+                                           ("o_proj","attn_out")):
+                    sub = getattr(sa, sub_name, None)
+                    if sub is not None:
+                        hooks.append(sub.register_forward_hook(mk_post(key_name)(li)))
 
     try:
         for tag, text, ids in prompts:
