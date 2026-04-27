@@ -35,3 +35,10 @@ logs/
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+
+# Private working notes — designs, implementation plans, strategy docs.
+# Keep these local; do NOT push to GitHub. Older plans already on
+# fork/rocm and fork/apu remain public for history; new work stays
+# behind this gate.
+docs/superpowers/
+docs/plan-*.md
