@@ -19,21 +19,21 @@ Columns are `<backend> × <model>`. Rows are user-visible capabilities.
 
 | Capability | Metal × Qwen3.5-397B | Metal × Qwen3.6 | Metal × Kimi | CUDA × Qwen3.5-397B | CUDA × Qwen3.6 | CUDA × Kimi | ROCm × Qwen3.5-397B | ROCm × Qwen3.6 | ROCm × Kimi | APU × Qwen3.5-397B | APU × Qwen3.6 | APU × Kimi |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Run model end-to-end | ✅ | — | — | ✅ | ✅ | ❌ | ✅ | — | — | ❌ | — | — |
-| Tool calling (JSON-stable) | ✅ | — | — | ❌ | ❌ | ❌ | ❌ | — | — | ❌ | — | — |
+| Run model end-to-end | 🟡 | — | — | 🟡 | 🟡 | ❌ | 🟡 | — | — | ❌ | — | — |
+| Tool calling (JSON-stable) | 🟡 | — | — | ❌ | ❌ | ❌ | ❌ | — | — | ❌ | — | — |
 | Multi-turn agent loop | ❌ | — | — | ❌ | ❌ | ❌ | ❌ | — | — | ❌ | — | — |
-| HTTP/SSE serve mode (OpenAI-compatible) | ✅ | — | — | ✅ | ❌ | ❌ | ❌ | — | — | ❌ | — | — |
-| Streaming SSD experts | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | — | — | 🟡 | — | — |
-| VRAM/RAM LRU expert cache | — | — | — | ❌ | ✅ | 🟡 | ✅ | — | — | ❌ | — | — |
-| FP8 quant (e4m3 block-128) | — | — | — | — | ✅ | — | — | — | — | — | — | — |
-| int4 quant (custom pack) | ✅ | — | — | ✅ | — | — | ✅ | — | — | 🟡 | — | — |
-| sym-int4 quant (compressed-tensors) | — | — | — | — | — | ✅ | — | — | — | — | — | — |
-| MLA attention | — | — | — | — | — | ✅ | — | — | — | — | — | — |
-| GatedDeltaNet (linear attention) | ✅ | — | — | ✅ | ✅ | — | ✅ | — | — | 🟡 | — | — |
-| Full attention with output-gate | — | — | — | — | ✅ | — | — | — | — | — | — | — |
-| RoPE (full + partial) | ✅ | — | — | ✅ | ✅ | 🟡 | ✅ | — | — | 🟡 | — | — |
-| Tokenizer subprocess | — | — | — | ✅ | ✅ | ✅ | ✅ | — | — | 🟡 | — | — |
-| Greedy + top-p sampling | ✅ | — | — | ✅ | ✅ | ❌ | ✅ | — | — | ❌ | — | — |
+| HTTP/SSE serve mode (OpenAI-compatible) | 🟡 | — | — | 🟡 | ❌ | ❌ | ❌ | — | — | ❌ | — | — |
+| Streaming SSD experts | 🟡 | — | — | 🟡 | 🟡 | 🟡 | 🟡 | — | — | 🟡 | — | — |
+| VRAM/RAM LRU expert cache | — | — | — | ❌ | 🟡 | 🟡 | 🟡 | — | — | ❌ | — | — |
+| FP8 quant (e4m3 block-128) | — | — | — | — | 🟡 | — | — | — | — | — | — | — |
+| int4 quant (custom pack) | 🟡 | — | — | 🟡 | — | — | 🟡 | — | — | 🟡 | — | — |
+| sym-int4 quant (compressed-tensors) | — | — | — | — | — | 🟡 | — | — | — | — | — | — |
+| MLA attention | — | — | — | — | — | 🟡 | — | — | — | — | — | — |
+| GatedDeltaNet (linear attention) | 🟡 | — | — | 🟡 | 🟡 | — | 🟡 | — | — | 🟡 | — | — |
+| Full attention with output-gate | — | — | — | — | 🟡 | — | — | — | — | — | — | — |
+| RoPE (full + partial) | 🟡 | — | — | 🟡 | 🟡 | 🟡 | 🟡 | — | — | 🟡 | — | — |
+| Tokenizer subprocess | — | — | — | 🟡 | 🟡 | 🟡 | 🟡 | — | — | 🟡 | — | — |
+| Greedy + top-p sampling | 🟡 | — | — | 🟡 | 🟡 | ❌ | 🟡 | — | — | ❌ | — | — |
 
 ## Reliability bar
 
