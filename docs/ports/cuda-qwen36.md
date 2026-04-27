@@ -3,7 +3,7 @@
 > **Branch:** `cuda-qwen36`
 > **Status:** working at ~7-8 tok/s on RTX 4090 with VRAM LRU expert cache.
 > **Coarse summary:** see [`../STATUS.md`](../STATUS.md).
-> **Source notes:** [`Qwen3.6 Port` (Obsidian)](../../README.md) and `~/.claude/.../memory/project_qwen36_port.md`.
+> **Source notes:** local working notes (Obsidian "Qwen3.6 Port" + `~/.claude/projects/-home-sergey-flash-moe/memory/project_qwen36_port.md`).
 
 ## Capability matrix (detailed) — model: Qwen3.6-35B-A3B-FP8
 
