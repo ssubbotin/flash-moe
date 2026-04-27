@@ -6,6 +6,14 @@ Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion par
 
 The entire 209GB model streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
 
+## Project status
+
+**What works on which backend, with which model:** see [`docs/STATUS.md`](docs/STATUS.md).
+
+Per-port detail in [`docs/ports/<port>.md`](docs/ports/).
+
+A cell is allowed to be ✅ only when the model on that backend has cleared the project reliability bar: a multi-turn agent loop (5+ tool calls, file edits, no drift) plus a small fixed eval. Working mechanism without that test stays 🟡.
+
 ## Results
 
 ![Progress](progress.png)
