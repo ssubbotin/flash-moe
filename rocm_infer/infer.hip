@@ -32,6 +32,7 @@
 
 #include "kernels.hip.h"
 #include "kernels_aotriton_attn.hip.h"
+#include "kernels_fla_gdn.hip.h"
 
 // aotriton flash attention (Task 1.3) — gated behind FLASH_MOE_AOTRITON_FA env var.
 #include <aotriton/flash.h>
@@ -1824,13 +1825,24 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         //   GGUF (g_quant_format == 1): modulo  — V heads 0,16,32,48 share K head 0 (matches llama.cpp)
         uint32_t khpv = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;
         uint32_t kh_mode = (g_quant_format == 1) ? 1u : 0u;
-        gated_delta_net_step<<<LINEAR_NUM_V_HEADS, 128>>>(
-            model->delta_state[layer_idx],
-            model->buf_conv_output,                           // q [2048] (scaled for GGUF)
-            model->buf_conv_output + LINEAR_TOTAL_KEY,        // k [2048]
-            model->buf_conv_output + 2 * LINEAR_TOTAL_KEY,    // v [8192]
-            model->buf_g_decay, model->buf_beta_gate,
-            model->buf_delta_output, khpv, kh_mode);
+        static const int s_use_fla_gdn = (getenv("FLASH_MOE_FLA_GDN") != NULL) ? 1 : 0;
+        if (s_use_fla_gdn) {
+            gated_delta_net_step_fla<<<LINEAR_NUM_V_HEADS, 128>>>(
+                model->delta_state[layer_idx],
+                model->buf_conv_output,                           // q [2048]
+                model->buf_conv_output + LINEAR_TOTAL_KEY,        // k [2048]
+                model->buf_conv_output + 2 * LINEAR_TOTAL_KEY,    // v [8192]
+                model->buf_g_decay, model->buf_beta_gate,
+                model->buf_delta_output, khpv, kh_mode);
+        } else {
+            gated_delta_net_step<<<LINEAR_NUM_V_HEADS, 128>>>(
+                model->delta_state[layer_idx],
+                model->buf_conv_output,                           // q [2048] (scaled for GGUF)
+                model->buf_conv_output + LINEAR_TOTAL_KEY,        // k [2048]
+                model->buf_conv_output + 2 * LINEAR_TOTAL_KEY,    // v [8192]
+                model->buf_g_decay, model->buf_beta_gate,
+                model->buf_delta_output, khpv, kh_mode);
+        }
 
         if (layer_idx == 0 && g_dump_layer0) {
             float d5[5];
