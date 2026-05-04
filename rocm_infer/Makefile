@@ -17,8 +17,14 @@ else
   WARP_SIZE ?= 32
 endif
 
-CFLAGS = -O2 --offload-arch=$(GPU_TARGETS) -DWARP_SIZE=$(WARP_SIZE)
-LDFLAGS = -lpthread
+# aotriton (optional, for Flash Attention on full-attention layers).
+# Set AOTRITON_PREFIX=/opt/aotriton or similar if not in a standard path.
+AOTRITON_PREFIX ?= /opt/aotriton
+AOTRITON_CFLAGS ?= -I$(AOTRITON_PREFIX)/include
+AOTRITON_LIB ?= -L$(AOTRITON_PREFIX)/lib -laotriton_v2 -Wl,-rpath,$(AOTRITON_PREFIX)/lib
+
+CFLAGS = -O2 --offload-arch=$(GPU_TARGETS) -DWARP_SIZE=$(WARP_SIZE) $(AOTRITON_CFLAGS)
+LDFLAGS = -lpthread $(AOTRITON_LIB)
 
 TARGET = infer
 
