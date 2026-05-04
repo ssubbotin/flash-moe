@@ -4,11 +4,15 @@
 
 **Goal:** Land a focused PR (or PR series) on `ggml-org/llama.cpp` that adds GPU-resident LRU caching for MoE expert weights with optional SSD streaming, plus an MI300X-tuned fused MoE kernel — and ship a small MIT-licensed companion repo with an agent demo. Targets the AMD Developer Hackathon (deadline 2026-05-10).
 
-**Architecture:**
-- New `ggml-backend`-level abstraction: `ggml_moe_expert_cache` that owns a fixed-size GPU buffer pool, an LRU index keyed by `(layer_id, expert_id)`, and a pluggable miss source (default: copy from CPU mmap'd weights; opt-in: pread from a packed SSD file).
-- Hooked into `MUL_MAT_ID` / `mmid.cu` so cache lookups happen at the kernel-dispatch site without changing the public ggml API.
+**Architecture (Option D after 2026-05-04 recon — supersedes the original Phase 2/3/4 plan; see "Plan revision note" below):**
+
+- New CUDA/HIP-backend buffer type **`ggml_backend_buffer_type_moe_stream`**. Tensors allocated through it are MoE expert weights; their `data` is a stable pseudo-pointer (the buffer-type handles all reads), and the bytes live in a 3-tier cache: VRAM LRU pool (the Phase 1 cache), OS page cache (kernel-managed), SSD pack file (per layer).
+- The CUDA backend's `supports_op(MUL_MAT_ID)` returns true for ops whose src0 sits in `moe_stream` buffers and dispatches a **custom MoE forward path** instead of the existing MMVQ/MMQ/MMVF/MMF kernels: routing → 3-tier expert lookup for K active experts → fused dequant+SwiGLU+down kernel (the Sergey-authored kernel ported from `mi300-opt/rocm_infer/kernels_fused_moe.hip.h`) → write outputs.
+- This mirrors flash-moe's `infer.hip` `layer_forward` pattern 1-to-1: VRAM cache → page cache fallback → SSD pread → custom kernel on K device pointers. It also mirrors llama.cpp's existing `--n-cpu-moe` shape (load-time tensor-buffer-type override), so upstream reviewers have a precedent.
 - Backend kernel work lands in `ggml/src/ggml-cuda/` with HIP guards (which is how `ggml-hip` already shares CUDA sources). gfx942-specific tunings gated by `defined(__HIP_PLATFORM_AMD__) && defined(__gfx942__)`.
-- All code written from public references (vLLM, AITER MIT, llama.cpp itself, e1n00r/tinyserve, the Qwen3.5 paper). **Zero lines copied from danveloper/flash-moe** to keep our PR (and our companion repo) MIT-licensable.
+- All code written from public references (vLLM, AITER MIT, llama.cpp itself, e1n00r/tinyserve, the Qwen3.5 paper) — and from the three Sergey-authored files on `mi300-opt` whose copyright header explicitly carries `Sergey Subbotin`. **Zero lines copied from danveloper/flash-moe** to keep our PR (and our companion repo) MIT-licensable.
+
+**Plan revision note:** The original Phases 2/3/4 assumed we could intercept per-expert weight pointers inside `mmid.cu`. Recon (2026-05-04) showed the real decode path uses kernels (`mmvq`/`mmq`/`mmvf`/`mmf`) that take a single contiguous expert-slab pointer + ids tensor; the per-expert loop in `ggml-cuda.cu:2585` is reached only on prefill / large batch, not on decode. The buffer-type + custom-dispatch architecture (Option D) sidesteps the kernel-level intercept entirely, runs on the decode path, and matches both flash-moe and `--n-cpu-moe`. Phase 1 stands unchanged — the Phase 1 LRU is now the VRAM tier of the new buffer type.
 
 **Tech Stack:** llama.cpp upstream (MIT), ggml (MIT), HIP/ROCm 7.2 for MI300X path, CMake, ctest. Companion demo repo: Python 3.11+ with `openai` SDK (MIT) and `httpx`.
 
@@ -530,453 +534,833 @@ git commit -m "tests: LRU policy + miss/hit/eviction accounting for ggml-moe-cac
 
 ---
 
-## Phase 2 — wire the cache into MUL_MAT_ID
+## Phase 2 — MoE streaming buffer type (skeleton)
 
-### Task 2.1: Read the existing `mmid.cu` dispatch and identify the hook point
+The buffer type is the integration surface. Tensors allocated through it carry MoE expert metadata and a per-layer file descriptor; they don't have device-resident data of their own. Reads from these tensors, when they happen via the kernel dispatch in Phase 4, route through the cache+stream path. Phase 2 lands the buffer-type machinery with a no-op miss handler so the build is clean and the model loader can be exercised; Phase 3 wires the real 3-tier source.
 
-**Files:**
-- Read-only: `ggml/src/ggml-cuda/mmid.cu`, `ggml/src/ggml-cuda/mmid.cuh`
+### Task 2.1: Reread the recon (no code, build shared understanding)
 
-- [ ] **Step 1: Locate the per-expert weight pointer in `ggml_cuda_mul_mat_id`**
+The 2026-05-04 recon found:
+- `ggml/src/ggml-cuda/common.cuh:1365` — `struct ggml_backend_cuda_context` (room for new fields, but no public reach-in from `llama-context.cpp`).
+- `ggml/src/ggml-cuda/ggml-cuda.cu:2470` — `ggml_cuda_mul_mat_id`. Two paths: fast (decode batch=1, takes one slab + ids, lines 2484-2509) and slow (per-expert loop, line 2585+). The fast path is what we need to claim.
+- `ggml/src/ggml-cuda/{mmvq,mmq,mmvf,mmf}.{cu,cuh}` — kernel-level launches that consume `src0->data` as a single base. Untouched in Option D.
+- `common/arg.cpp:2308-2321` — `--n-cpu-moe` is a `tensor_buft_overrides` push (regex match on `blk.<i>.ffn_*_exps`, route to `ggml_backend_cpu_buffer_type()`). Our `--moe-stream-dir` mirrors this exactly: same regex, route to `ggml_backend_cuda_buffer_type_moe_stream(dev, dir)`.
 
-```bash
-ssh mi300 "grep -n 'mul_mat_id\|src0_row\|expert' ~/llamacpp-moe-cache/ggml/src/ggml-cuda/mmid.cu | head -20"
-```
+No commit for this task — it's a controller checkpoint that the implementer has the recon report in hand before writing buffer-type code.
 
-Identify where the source-tensor pointer for expert `e` is computed (something like `src0->data + e * stride`). Record the line number and the variable name in this plan's notes for Task 2.2 reference.
-
-- [ ] **Step 2: Look at how the kernel receives the pointer**
-
-```bash
-ssh mi300 "grep -n 'launch_mul_mat_id\|kernel<<<' ~/llamacpp-moe-cache/ggml/src/ggml-cuda/mmid.cu | head -20"
-```
-
-Note whether the kernel takes a single base pointer + per-expert index OR an array of K pointers. Our cache integration follows the same convention.
-
-(No commit — reconnaissance only.)
-
-### Task 2.2: Add the GPU-side cache adapter `moe-cache.cu`
+### Task 2.2: Define the buffer-type C API
 
 **Files:**
-- Create: `ggml/src/ggml-cuda/moe-cache.cu`
-- Create: `ggml/src/ggml-cuda/moe-cache.cuh`
+- Create: `ggml/src/ggml-cuda/buft-moe-stream.cuh`
+- Create: `ggml/src/ggml-cuda/buft-moe-stream.cu`
 
-- [ ] **Step 1: Write the header**
+- [ ] **Step 1: Header**
 
 ```cpp
-// ggml/src/ggml-cuda/moe-cache.cuh
+// ggml/src/ggml-cuda/buft-moe-stream.cuh
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sergey Subbotin
 #pragma once
 #include "common.cuh"
 #include "ggml-moe-cache.h"
 
-// CUDA/HIP backend hook: returns a device pointer for expert (l, e),
-// honoring the cache. ctx->moe_cache may be null (no cache configured),
-// in which case the caller falls back to the normal `src0->data` path.
-const void *ggml_cuda_moe_cache_lookup(ggml_backend_cuda_context &ctx,
-                                       int layer_id, int expert_id);
-
-// Build a CPU-mmap-source miss function for the common case where the
-// expert weights are present in host memory (e.g. after model load with
-// --no-mmap-experts off). The user data is the base pointer + stride.
-struct ggml_cuda_moe_cpu_src {
-    const void *base;
-    size_t      expert_stride; // bytes between experts in CPU buffer
-    cudaStream_t stream;       // for async H2D copy
+// Per-tensor metadata held by buffers of this buffer type.
+struct ggml_cuda_moe_stream_meta {
+    int          layer_id;       // parsed from tensor name `blk.<L>.ffn_*_exps.weight`
+    int          fd;             // open() of <ssd_dir>/layer_<NN>.bin (one fd per layer, refcounted by buffer)
+    size_t       expert_bytes;   // bytes per expert blob in the file
+    int          num_experts;
 };
-int ggml_cuda_moe_miss_from_cpu(void *user_data, int layer, int expert,
-                                void *dst, size_t bytes);
+
+// Public API: returns a singleton-per-(device, ssd_dir) buffer type.
+// `ssd_dir` may be empty — in that case Phase 3's miss handler will fall
+// back to the GGUF mmap source.
+ggml_backend_buffer_type_t
+ggml_backend_cuda_buffer_type_moe_stream(int device, const char *ssd_dir);
+
+// Returns the per-tensor metadata if `tensor` lives in a moe_stream buffer,
+// otherwise nullptr. Used by the dispatch hook in Phase 4 to recognize
+// "this MUL_MAT_ID is mine".
+const ggml_cuda_moe_stream_meta *
+ggml_cuda_moe_stream_get_meta(const ggml_tensor *tensor);
+
+// Get the cache instance attached to a moe_stream buffer (Phase 1 LRU).
+// Phase 4 dispatch calls _get on it for each active expert.
+struct ggml_moe_cache *
+ggml_cuda_moe_stream_get_cache(ggml_backend_buffer_t buf);
 ```
 
-- [ ] **Step 2: Write the implementation**
+- [ ] **Step 2: Implementation skeleton (no-op miss handler)**
 
 ```cpp
-// ggml/src/ggml-cuda/moe-cache.cu
-#include "moe-cache.cuh"
+// ggml/src/ggml-cuda/buft-moe-stream.cu
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sergey Subbotin
+//
+// Custom CUDA/HIP buffer type for streamed MoE expert weights.
+// References consulted: vLLM RFC #38256 (Apache 2.0), llama.cpp PR #11397
+// tensor_buft_overrides (MIT), AITER (MIT). Phase 1 LRU is reused as the
+// VRAM tier of the 3-tier cache here.
+#include "buft-moe-stream.cuh"
+#include "ggml-impl.h"
+#include <cstring>
+#include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
+#include <map>
+#include <mutex>
+#include <string>
 
-const void *ggml_cuda_moe_cache_lookup(ggml_backend_cuda_context &ctx,
-                                       int layer_id, int expert_id) {
-    if (!ctx.moe_cache) return nullptr;
-    return ggml_moe_cache_get(ctx.moe_cache, layer_id, expert_id);
+namespace {
+
+struct buft_context {
+    int         device;
+    std::string ssd_dir;
+    // Per-(device, ssd_dir) singleton — the cache itself attaches to the
+    // first buffer allocated; subsequent buffers share it via the singleton.
+    ggml_moe_cache *cache = nullptr;
+    size_t          cache_pool_bytes = 0;
+};
+
+struct buf_context {
+    buft_context *bt;
+    // For each tensor allocated in this buffer, we hold its metadata so
+    // ggml_cuda_moe_stream_get_meta can recover it from a tensor pointer.
+    std::map<const ggml_tensor *, ggml_cuda_moe_stream_meta> tensors;
+    void *base = nullptr;     // pseudo-base (we hand out unique offsets here)
+    size_t size = 0;
+    size_t cursor = 0;        // bump allocator within `base`
+};
+
+// Phase 2 miss handler: stub. Phase 3 replaces this with the 3-tier source.
+int stub_miss(void *user_data, int layer_id, int expert_id, void *dst, size_t bytes) {
+    (void)user_data; (void)layer_id; (void)expert_id; (void)dst; (void)bytes;
+    GGML_LOG_ERROR("ggml-cuda moe-stream: Phase 2 stub miss handler hit (L=%d E=%d) — Phase 3 not landed yet\n",
+                   layer_id, expert_id);
+    return 1;
 }
 
-int ggml_cuda_moe_miss_from_cpu(void *ud, int layer, int expert,
-                                void *dst, size_t bytes) {
-    auto *src = (ggml_cuda_moe_cpu_src *)ud;
-    const char *p = (const char *)src->base
-                  + ((size_t)layer * 0 /*layers stored separately*/ )
-                  + (size_t)expert * src->expert_stride;
-    // NOTE: layer offset is the caller's responsibility — the cpu_src
-    // struct is per-layer in the simplest wiring (Phase 2 stores one
-    // cpu_src per MoE layer in the context). See Task 2.3.
-    cudaMemcpyAsync(dst, p, bytes, cudaMemcpyHostToDevice, src->stream);
-    return cudaStreamSynchronize(src->stream) == cudaSuccess ? 0 : 1;
+} // namespace
+
+// ---------------- buffer iface ----------------
+
+static const char * gfx_buf_name(ggml_backend_buffer_t buf) {
+    return "CUDA_MOE_STREAM";
+}
+
+static void gfx_buf_free(ggml_backend_buffer_t buf) {
+    auto *ctx = (buf_context *)buf->context;
+    delete ctx;
+}
+
+static void * gfx_buf_get_base(ggml_backend_buffer_t buf) {
+    auto *ctx = (buf_context *)buf->context;
+    return ctx->base;
+}
+
+static void gfx_buf_init_tensor(ggml_backend_buffer_t buf, ggml_tensor *tensor) {
+    auto *ctx = (buf_context *)buf->context;
+    // Parse layer index from tensor name `blk.<L>.ffn_*_exps.weight`.
+    int layer = -1;
+    int n = sscanf(tensor->name, "blk.%d.", &layer);
+    if (n != 1 || layer < 0) {
+        // Not a MoE expert tensor — shouldn't be allocated here, but be defensive.
+        return;
+    }
+    ggml_cuda_moe_stream_meta meta {};
+    meta.layer_id    = layer;
+    meta.num_experts = (int)tensor->ne[2];
+    meta.expert_bytes = ggml_nbytes(tensor) / meta.num_experts;
+    meta.fd = -1;  // Phase 3 will open <ssd_dir>/layer_<NN>.bin and dup its fd here
+    ctx->tensors[tensor] = meta;
+    // Pseudo-pointer — the dispatch in Phase 4 only ever uses tensor->data
+    // as a key to recover meta, never dereferences it on host.
+    tensor->data = (char *)ctx->base + ctx->cursor;
+    ctx->cursor += ggml_nbytes(tensor);
+}
+
+static void gfx_buf_set_tensor(ggml_backend_buffer_t buf, ggml_tensor *tensor,
+                               const void *data, size_t offset, size_t size) {
+    // Phase 2 stub — Phase 3 writes the SSD file here on first set.
+    auto *ctx = (buf_context *)buf->context;
+    auto it = ctx->tensors.find(tensor);
+    if (it == ctx->tensors.end()) return;
+    GGML_LOG_DEBUG("moe-stream set_tensor: tensor=%s offset=%zu size=%zu (Phase 2 stub, ignored)\n",
+                   tensor->name, offset, size);
+    // We intentionally do not copy to VRAM here — the data lives on disk.
+    // Phase 3 streams it back in on cache miss.
+}
+
+static void gfx_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tensor *tensor,
+                               void *data, size_t offset, size_t size) {
+    GGML_LOG_ERROR("moe-stream get_tensor not supported (Phase 2)\n");
+}
+
+static bool gfx_buf_cpy_tensor(ggml_backend_buffer_t buf, const ggml_tensor *src,
+                               ggml_tensor *dst) {
+    return false;  // never participate in tensor copies
+}
+
+static void gfx_buf_clear(ggml_backend_buffer_t buf, uint8_t value) {
+    // No-op — we don't own real device memory directly (the LRU pool does).
+}
+
+static const ggml_backend_buffer_i moe_stream_buf_iface = {
+    /* .free_buffer  */ gfx_buf_free,
+    /* .get_base     */ gfx_buf_get_base,
+    /* .init_tensor  */ gfx_buf_init_tensor,
+    /* .memset_tensor*/ nullptr,
+    /* .set_tensor   */ gfx_buf_set_tensor,
+    /* .get_tensor   */ gfx_buf_get_tensor,
+    /* .cpy_tensor   */ gfx_buf_cpy_tensor,
+    /* .clear        */ gfx_buf_clear,
+    /* .reset        */ nullptr,
+};
+
+// ---------------- buffer-type iface ----------------
+
+static const char * gfx_buft_name(ggml_backend_buffer_type_t buft) {
+    return "CUDA_MOE_STREAM";
+}
+
+static ggml_backend_buffer_t
+gfx_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto *bt = (buft_context *)buft->context;
+    auto *bc = new buf_context;
+    bc->bt   = bt;
+    bc->size = size;
+    // Reserve a pseudo-address space — we hand out distinct offsets for
+    // each init_tensor call. Real device memory is held by the LRU pool
+    // (bt->cache), allocated lazily on first cache_init.
+    static uintptr_t next_pseudo = 0x1000;
+    bc->base = (void *)(next_pseudo);
+    next_pseudo += size + 0x1000;
+    bc->cursor = 0;
+    return ggml_backend_buffer_init(buft, moe_stream_buf_iface, bc, size);
+}
+
+static size_t gfx_buft_get_alignment(ggml_backend_buffer_type_t buft) {
+    return 256;
+}
+
+static size_t gfx_buft_get_max_size(ggml_backend_buffer_type_t buft) {
+    return SIZE_MAX;
+}
+
+static bool gfx_buft_is_host(ggml_backend_buffer_type_t buft) {
+    return false;
+}
+
+static const ggml_backend_buffer_type_i moe_stream_buft_iface = {
+    /* .get_name        */ gfx_buft_name,
+    /* .alloc_buffer    */ gfx_buft_alloc_buffer,
+    /* .get_alignment   */ gfx_buft_get_alignment,
+    /* .get_max_size    */ gfx_buft_get_max_size,
+    /* .get_alloc_size  */ nullptr,
+    /* .is_host         */ gfx_buft_is_host,
+};
+
+ggml_backend_buffer_type_t
+ggml_backend_cuda_buffer_type_moe_stream(int device, const char *ssd_dir) {
+    static std::mutex                                                         mu;
+    static std::map<std::pair<int, std::string>, ggml_backend_buffer_type *>  cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto key = std::make_pair(device, std::string(ssd_dir ? ssd_dir : ""));
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    auto *bt = new buft_context;
+    bt->device  = device;
+    bt->ssd_dir = key.second;
+    auto *buft = new ggml_backend_buffer_type{
+        /* .iface   */ moe_stream_buft_iface,
+        /* .device  */ ggml_backend_cuda_reg_get_device(device),
+        /* .context */ bt,
+    };
+    cache[key] = buft;
+    return buft;
+}
+
+const ggml_cuda_moe_stream_meta *
+ggml_cuda_moe_stream_get_meta(const ggml_tensor *tensor) {
+    if (!tensor || !tensor->buffer) return nullptr;
+    if (tensor->buffer->iface.get_name != gfx_buf_name) return nullptr;
+    auto *ctx = (buf_context *)tensor->buffer->context;
+    auto it = ctx->tensors.find(tensor);
+    return (it == ctx->tensors.end()) ? nullptr : &it->second;
+}
+
+struct ggml_moe_cache *
+ggml_cuda_moe_stream_get_cache(ggml_backend_buffer_t buf) {
+    auto *ctx = (buf_context *)buf->context;
+    return ctx->bt->cache;  // may be nullptr until Phase 3 attaches it
 }
 ```
 
-- [ ] **Step 3: Wire into `ggml-cuda.cu`**
+- [ ] **Step 3: Wire into the CUDA build (CMake or source list)**
 
-In `ggml/src/ggml-cuda/ggml-cuda.cu`, extend the `ggml_backend_cuda_context` struct (header `common.cuh`) to hold:
-
-```cpp
-ggml_moe_cache *moe_cache = nullptr;
-```
-
-Add cleanup in the backend's destructor.
-
-- [ ] **Step 4: Build**
+If `ggml/src/ggml-cuda/CMakeLists.txt` globs `*.cu`, the new files are picked up automatically. If it has an explicit list, append both. Verify with:
 
 ```bash
-ssh mi300 "cd ~/llamacpp-moe-cache && cmake --build build -j 2>&1 | tail -10"
+grep -n 'buft-moe-stream\|*.cu' ~/llamacpp-moe-cache/ggml/src/ggml-cuda/CMakeLists.txt
 ```
 
-Expected: clean build.
+- [ ] **Step 4: Build on mi300**
+
+```bash
+rsync -az --exclude=.git --exclude=build --exclude=build-local --exclude=models ~/llamacpp-moe-cache/ mi300:~/llamacpp-moe-cache/
+ssh mi300 "cd ~/llamacpp-moe-cache && cmake --build build -j --target ggml-hip 2>&1 | tail -10"
+```
+
+Expected: clean build. (Target is `ggml-hip` when `GGML_HIP=ON`; if cmake renamed it, the `tail -10` will show `make: *** No rule to make target` — try `ggml` or `ggml-cuda`.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ggml/src/ggml-cuda/moe-cache.{cu,cuh} ggml/src/ggml-cuda/ggml-cuda.cu ggml/src/ggml-cuda/common.cuh
-git commit -m "ggml-cuda: scaffolding for MoE cache lookup + CPU miss source (no dispatch yet)"
+git add ggml/src/ggml-cuda/buft-moe-stream.{cu,cuh} ggml/src/ggml-cuda/CMakeLists.txt
+git commit -m "ggml-cuda: skeleton MoE streaming buffer type (no-op miss, parses layer-id from tensor name)"
 ```
 
-### Task 2.3: Hook `mmid.cu` to route per-expert weights through the cache
+### Task 2.3: `--moe-stream-dir` and `--moe-cache-mb` CLI flags
 
 **Files:**
-- Modify: `ggml/src/ggml-cuda/mmid.cu`
+- Modify: `common/arg.cpp`
+- Modify: `common/common.h`
+- Modify: `common/common.cpp` (the regex push that mirrors `--n-cpu-moe`)
 
-- [ ] **Step 1: Replace the per-expert pointer derivation with a cache lookup**
-
-In the spot identified in Task 2.1, change the code that computes the per-expert source pointer from:
-
-```cpp
-const void *src0_e = (const char *)src0->data + e * src0_e_stride;
-```
-
-to:
+- [ ] **Step 1: Add `moe_stream_dir` (string) and `moe_cache_mb` (int) to `common_params`**
 
 ```cpp
-const void *src0_e = nullptr;
-if (ctx.moe_cache) {
-    src0_e = ggml_cuda_moe_cache_lookup(ctx, layer_id, e);
-}
-if (!src0_e) {
-    src0_e = (const char *)src0->data + e * src0_e_stride;
-}
+// common/common.h, inside struct common_params (place near n_cpu_moe)
+std::string moe_stream_dir;   // empty = disabled
+int         moe_cache_mb = 0; // 0 = disabled
 ```
 
-Where `layer_id` is derived from the tensor's `op_params` or from a layer-id field added to `ggml_tensor` (we'll need to thread it through — start by deriving from the tensor name's layer index suffix as a temporary measure).
-
-- [ ] **Step 2: Build with cache disabled (default), bench unchanged**
-
-```bash
-ssh mi300 "cd ~/llamacpp-moe-cache && cmake --build build -j --target llama-bench && build/bin/llama-bench -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 -t 8 -p 512 -n 128 2>&1 | tail -5"
-```
-
-Expected: same tok/s as Task 0.3 baseline (cache is null, so the new code path falls through).
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add ggml/src/ggml-cuda/mmid.cu
-git commit -m "ggml-cuda: route per-expert pointer through MoE cache when configured (no-op when disabled)"
-```
-
-### Task 2.4: Surface CLI flag `--moe-cache-mb` and instantiate the cache
-
-**Files:**
-- Modify: `common/arg.cpp`, `common/common.h`
-- Modify: `src/llama-context.cpp`
-
-- [ ] **Step 1: Add the flag**
-
-In `common/arg.cpp`, add an arg parser entry near the existing `--n-cpu-moe`:
+- [ ] **Step 2: Add the args**
 
 ```cpp
+// common/arg.cpp — add after the n_cpu_moe block
 add_opt(common_arg(
-    {"--moe-cache-mb"},
-    "MB", "GPU MoE expert cache size in MiB (0 = disabled)",
+    {"--moe-stream-dir"}, "DIR",
+    "stream MoE expert weights from per-layer files in DIR via the CUDA moe-stream buffer type",
+    [](common_params & params, const std::string & v) { params.moe_stream_dir = v; }
+).set_env("LLAMA_ARG_MOE_STREAM_DIR"));
+
+add_opt(common_arg(
+    {"--moe-cache-mb"}, "MB",
+    "MoE expert VRAM cache size in MiB (0 = disabled). Requires --moe-stream-dir.",
     [](common_params & params, int v) { params.moe_cache_mb = v; }
 ).set_env("LLAMA_ARG_MOE_CACHE_MB"));
 ```
 
-In `common/common.h`, add `int moe_cache_mb = 0;` to `common_params`.
+- [ ] **Step 3: When `moe_stream_dir` is non-empty, push a `tensor_buft_overrides` entry**
 
-- [ ] **Step 2: Construct the cache after the backend is up**
-
-In `src/llama-context.cpp`, after the GPU backends are initialized and the model is loaded (find the existing CUDA/HIP backend init block), if `cparams.moe_cache_mb > 0` and the model has MoE layers, build the params and call `ggml_moe_cache_init`. Store the result on the per-backend context so the kernel hook from Task 2.3 can reach it.
-
-(Concrete code location and field name will depend on the current llama-context layout; identify by `grep -n 'ggml_backend_cuda_init' src/llama-context.cpp` and adapt.)
-
-- [ ] **Step 3: Smoke test with cache on**
-
-```bash
-ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-bench -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 -t 8 -p 512 -n 128 --moe-cache-mb 8192 2>&1 | tail -10"
-```
-
-Expected: same correctness, possibly slightly different tok/s (cache adds bookkeeping but eliminates redundant pointer math). If tok/s drops more than 5%, investigate eviction churn before proceeding.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add common/arg.cpp common/common.h src/llama-context.cpp
-git commit -m "llama: --moe-cache-mb CLI flag, instantiate MoE cache when set"
-```
-
----
-
-## Phase 3 — SSD streaming as a miss source
-
-### Task 3.1: Define the SSD-source layout
-
-**Files:**
-- Create: `docs/moe-ssd-layout.md`
-
-- [ ] **Step 1: Document the on-disk format**
-
-```markdown
-# MoE SSD layout (one file per layer)
-
-Each layer's expert weights live in a single binary file named
-`layer_<NN>.bin` inside a user-supplied directory. Within the file,
-expert `e` starts at byte offset `e * expert_bytes`; layout matches
-the order of components in the GGUF tensor that produced it (gate_w,
-up_w, down_w concatenated and contiguous per expert). Files are
-written by an offline conversion script from any GGUF MoE checkpoint;
-no in-engine generation. Component order is fixed by `enum
-moe_expert_layout` in ggml-moe-cache.h.
-```
-
-This format mirrors the cache's `expert_bytes` exactly — no
-metadata header on the SSD file, so `pread(fd, dst, expert_bytes, e * expert_bytes)`
-suffices on cache miss.
-
-- [ ] **Step 2: Commit**
-
-```bash
-git add docs/moe-ssd-layout.md
-git commit -m "docs: MoE SSD per-layer file layout"
-```
-
-### Task 3.2: Implement the SSD miss source
-
-**Files:**
-- Create: `ggml/src/ggml-cuda/moe-cache-ssd.cu`
-- Modify: `ggml/src/ggml-cuda/moe-cache.cuh`
-
-- [ ] **Step 1: Add the SSD source struct + miss fn declaration to `moe-cache.cuh`**
+In `common/common.cpp`, find where `n_cpu_moe` pushes its overrides. Add a parallel block:
 
 ```cpp
-struct ggml_cuda_moe_ssd_src {
-    int        layer_fds[256];   // one fd per MoE layer (caller opens)
-    int        num_layers;
-    size_t     expert_bytes;
-    void *     pinned_staging;   // pinned host buffer, expert_bytes
-    cudaStream_t stream;
-};
-int ggml_cuda_moe_miss_from_ssd(void *user_data, int layer, int expert,
-                                void *dst, size_t bytes);
-```
-
-- [ ] **Step 2: Implement**
-
-```cpp
-// ggml/src/ggml-cuda/moe-cache-ssd.cu
-#include "moe-cache.cuh"
-#include <unistd.h>
-#include <sys/types.h>
-#include <cerrno>
-#include <cstring>
-
-int ggml_cuda_moe_miss_from_ssd(void *ud, int layer, int expert,
-                                void *dst, size_t bytes) {
-    auto *src = (ggml_cuda_moe_ssd_src *)ud;
-    if (layer < 0 || layer >= src->num_layers) return 1;
-    int fd = src->layer_fds[layer];
-    off_t off = (off_t)expert * (off_t)src->expert_bytes;
-    ssize_t got = pread(fd, src->pinned_staging, bytes, off);
-    if (got != (ssize_t)bytes) {
-        fprintf(stderr, "[moe-ssd] pread L%d E%d short read got=%zd err=%s\n",
-                layer, expert, got, strerror(errno));
-        return 1;
+// common/common.cpp — near the n_cpu_moe override push
+if (!params.moe_stream_dir.empty()) {
+    int dev = 0;  // Phase 2 wires device 0; multi-GPU lands later
+    auto buft = ggml_backend_cuda_buffer_type_moe_stream(dev, params.moe_stream_dir.c_str());
+    if (!buft) {
+        throw std::runtime_error("--moe-stream-dir requires CUDA/HIP backend");
     }
-    cudaMemcpyAsync(dst, src->pinned_staging, bytes,
-                    cudaMemcpyHostToDevice, src->stream);
-    return cudaStreamSynchronize(src->stream) == cudaSuccess ? 0 : 1;
+    common_params_handle_buft_override::add_layer_regex_override(
+        params.tensor_buft_overrides, "blk\\.\\d+\\.ffn_(gate|up|down)_exps\\.weight", buft);
 }
 ```
 
-- [ ] **Step 3: Add CLI flag `--moe-ssd-dir DIR`**
+(The exact helper name varies by upstream commit — `grep -n 'tensor_buft_overrides' common/common.cpp` will find the existing pattern from `--n-cpu-moe` to mirror.)
 
-In `common/arg.cpp` and `common/common.h`, add `std::string moe_ssd_dir;`. In `src/llama-context.cpp`, when the cache is being built and `cparams.moe_ssd_dir` is non-empty:
-- For each MoE layer, `open(<dir>/layer_<NN>.bin, O_RDONLY)`; store fds in `ggml_cuda_moe_ssd_src`
-- `cudaMallocHost(&pinned_staging, expert_bytes)`
-- Wire `miss_fn = ggml_cuda_moe_miss_from_ssd`
-
-- [ ] **Step 4: Build**
+- [ ] **Step 4: Smoke build + run with the flags (no model touch yet — flag parsing only)**
 
 ```bash
-ssh mi300 "cd ~/llamacpp-moe-cache && cmake --build build -j 2>&1 | tail -5"
+ssh mi300 "cd ~/llamacpp-moe-cache && cmake --build build -j --target llama-server llama-bench 2>&1 | tail -5"
+ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-server --help 2>&1 | grep -E 'moe-(stream-dir|cache-mb)'"
 ```
 
-Expected: clean build.
+Expected: both flags appear in `--help`. Smoke run with the flags but no model file yet would crash; that's fine — the flag is parsed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ggml/src/ggml-cuda/moe-cache-ssd.cu ggml/src/ggml-cuda/moe-cache.cuh common/arg.cpp common/common.h src/llama-context.cpp
-git commit -m "ggml-cuda: SSD miss source for MoE expert cache, --moe-ssd-dir flag"
+git add common/arg.cpp common/common.h common/common.cpp
+git commit -m "common: --moe-stream-dir and --moe-cache-mb flags, route MoE expert tensors through the streaming buffer type"
 ```
 
-### Task 3.3: Write the offline GGUF→per-layer converter
+### Task 2.4: Test that model load with `--moe-stream-dir` puts experts in our buffer type
+
+**Files:**
+- Modify: `tests/test-moe-cache.cpp` to also exercise the buffer type's tensor-init path
+
+Phase 2 has no real cache lookup (stub miss), so we can't run inference. We can still verify the loader pushes experts into our buffer type by checking `ggml_cuda_moe_stream_get_meta(tensor) != nullptr` for an `ffn_gate_exps` tensor after model load.
+
+- [ ] **Step 1: Add a unit test that loads a tiny MoE GGUF with the override**
+
+```cpp
+// Append to tests/test-moe-cache.cpp under a `#ifdef GGML_USE_CUDA` (or HIP) guard.
+// Uses Qwen2-0.5B-MoE or similar tiny MoE; if no tiny MoE GGUF is present,
+// skip the test. The test asserts that for an "ffn_gate_exps" tensor in the
+// loaded model, ggml_cuda_moe_stream_get_meta returns non-null with the
+// right num_experts and expert_bytes parsed from the tensor.
+//
+// (Implementer: pick the smallest MoE GGUF available locally; if none,
+// skip the test with a `printf("[skip] no MoE GGUF available\n"); return 0;`.)
+```
+
+If tracing this through the model loader is tangled, ship without this unit test and rely on the Phase 4 end-to-end test instead.
+
+- [ ] **Step 2: Commit (only if test added)**
+
+```bash
+git add tests/test-moe-cache.cpp
+git commit -m "tests: assert MoE expert tensors land in moe_stream buffer type when --moe-stream-dir is set"
+```
+
+---
+
+## Phase 3 — 3-tier expert source (LRU + page cache + SSD pread)
+
+The buffer type is in place; this phase fills in the actual miss handler so the LRU has somewhere to fetch from. The 3 tiers, in order:
+
+1. **VRAM LRU** (Phase 1 cache) — `_get(key)` returns a slot pointer or nullptr.
+2. **OS page cache** — first miss into VRAM falls back to a CPU mmap of the SSD pack file. Subsequent reads go through the kernel page cache. flash-moe's "trust the OS" principle.
+3. **SSD pread** — only on cold-cold miss when the page hasn't been pulled before, the kernel issues a real disk read.
+
+In our impl all three tiers collapse into a single miss path: `mmap` the per-layer SSD file at first access, then any `pread` (or pointer dereference) hits the page cache after warmup.
+
+### Task 3.1: Document the per-layer SSD layout
+
+**Files:**
+- Create: `docs/moe-stream-layout.md`
+
+- [ ] **Step 1: Write the layout doc**
+
+```markdown
+# moe-stream per-layer file layout
+
+Each MoE layer's expert weights live in `<ssd_dir>/layer_<NN>.bin`. Within
+the file, expert `e` starts at byte offset `e * expert_bytes` and is
+exactly `expert_bytes` long. No header, no metadata, no padding.
+
+`expert_bytes` is parsed from the GGUF tensor's `nbytes / ne[2]` at model
+load time and stored in `ggml_cuda_moe_stream_meta`. The file's expert
+ordering matches the GGUF tensor's expert axis (axis 2).
+
+For Q4_K_M MoE models: `expert_bytes = ne[0] * ne[1] / QK_K * sizeof(block_q4_K)`
+≈ 2.4 MB per expert per gate/up/down for typical 4096×1024 shapes.
+
+For Qwen3-235B-A22B Q4_K_M: 94 layers × 128 experts × ~7 MB per expert per
+proj × 3 projs ≈ 250 GB on disk. Fits comfortably on a 1 TB SSD.
+
+Files are written by `tools/moe-pack/moe-pack` (Task 3.3). It reads any
+GGUF MoE checkpoint and writes one `layer_<NN>.bin` per MoE layer with
+the gate/up/down expert blobs concatenated per expert in the order
+[gate_w, up_w, down_w]. The order is fixed; if a model uses a different
+GGUF tensor ordering, the converter normalizes.
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add docs/moe-stream-layout.md
+git commit -m "docs: per-layer SSD layout for moe-stream buffer type"
+```
+
+### Task 3.2: Implement the 3-tier miss handler
+
+**Files:**
+- Create: `ggml/src/ggml-cuda/moe-stream-source.cu`
+- Create: `ggml/src/ggml-cuda/moe-stream-source.cuh`
+- Modify: `ggml/src/ggml-cuda/buft-moe-stream.cu` — replace `stub_miss` with the real handler, allocate the LRU cache lazily, open per-layer fds in `init_tensor`.
+
+- [ ] **Step 1: Header**
+
+```cpp
+// ggml/src/ggml-cuda/moe-stream-source.cuh
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sergey Subbotin
+#pragma once
+#include "common.cuh"
+#include <stddef.h>
+
+struct moe_stream_source {
+    int          fd;             // per-layer
+    size_t       expert_bytes;
+    void *       mmap_base;      // host mmap of the layer file
+    size_t       mmap_bytes;
+    void *       pinned_staging; // pinned host buffer, expert_bytes
+    cudaStream_t stream;
+};
+
+// Open <ssd_dir>/layer_<NN>.bin, mmap it read-only, allocate pinned staging.
+// Returns 0 on success, fills `*out`. Releases everything via destructor.
+int moe_stream_source_open(const char *ssd_dir, int layer_id, size_t expert_bytes,
+                           cudaStream_t stream, moe_stream_source *out);
+void moe_stream_source_close(moe_stream_source *s);
+
+// Miss handler signature compatible with ggml_moe_miss_fn. user_data is a
+// `moe_stream_source *`. Copies expert_id's bytes from page cache /
+// pread to `dst` (which is in the LRU pool, device memory).
+int moe_stream_miss(void *user_data, int layer_id, int expert_id,
+                    void *dst, size_t bytes);
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// ggml/src/ggml-cuda/moe-stream-source.cu
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sergey Subbotin
+#include "moe-stream-source.cuh"
+#include "ggml-impl.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <cstring>
+
+int moe_stream_source_open(const char *ssd_dir, int layer_id, size_t expert_bytes,
+                           cudaStream_t stream, moe_stream_source *out) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/layer_%02d.bin", ssd_dir, layer_id);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        GGML_LOG_ERROR("moe-stream: cannot open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return 1; }
+    void *m = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { close(fd); return 1; }
+    out->fd            = fd;
+    out->expert_bytes  = expert_bytes;
+    out->mmap_base     = m;
+    out->mmap_bytes    = st.st_size;
+    out->stream        = stream;
+    if (cudaMallocHost(&out->pinned_staging, expert_bytes) != cudaSuccess) {
+        munmap(m, st.st_size); close(fd);
+        return 1;
+    }
+    return 0;
+}
+
+void moe_stream_source_close(moe_stream_source *s) {
+    if (!s) return;
+    if (s->pinned_staging) cudaFreeHost(s->pinned_staging);
+    if (s->mmap_base)      munmap(s->mmap_base, s->mmap_bytes);
+    if (s->fd >= 0)        close(s->fd);
+    *s = {};
+    s->fd = -1;
+}
+
+int moe_stream_miss(void *user_data, int layer_id, int expert_id,
+                    void *dst, size_t bytes) {
+    auto *s = (moe_stream_source *)user_data;
+    if (bytes != s->expert_bytes) {
+        GGML_LOG_ERROR("moe-stream: miss size mismatch (req=%zu have=%zu)\n",
+                       bytes, s->expert_bytes);
+        return 1;
+    }
+    // Tier 2/3 collapsed: read from mmap (page-cache hit if warm; pread on cold).
+    const char *src = (const char *)s->mmap_base + (size_t)expert_id * s->expert_bytes;
+    memcpy(s->pinned_staging, src, bytes);
+    if (cudaMemcpyAsync(dst, s->pinned_staging, bytes,
+                        cudaMemcpyHostToDevice, s->stream) != cudaSuccess) {
+        return 1;
+    }
+    return cudaStreamSynchronize(s->stream) == cudaSuccess ? 0 : 1;
+}
+```
+
+- [ ] **Step 3: Wire into `buft-moe-stream.cu`**
+
+In `init_tensor`, after parsing `layer_id`, open the per-layer source. Stash the `moe_stream_source` in the buffer-type context's `std::map<int, moe_stream_source>` keyed by `layer_id`. On first allocation in a buffer type, also call `ggml_moe_cache_init` with `cache_bytes = bt->cache_pool_bytes` (from `--moe-cache-mb`), `expert_bytes = meta.expert_bytes`, and `miss_fn = moe_stream_miss` with `miss_user_data = &source` — but note: the cache holds ONE miss_fn per cache, so the user_data can't change per-layer. Resolution: lift the `moe_stream_source` lookup into a wrapper miss function that takes `layer_id` and looks up the right source from a global-per-cache map.
+
+```cpp
+// In buft-moe-stream.cu near the cache-init site
+struct cache_user_data {
+    std::map<int, moe_stream_source> *layer_sources;
+};
+static int dispatching_miss(void *ud, int layer_id, int expert_id,
+                            void *dst, size_t bytes) {
+    auto *u = (cache_user_data *)ud;
+    auto it = u->layer_sources->find(layer_id);
+    if (it == u->layer_sources->end()) return 1;
+    return moe_stream_miss(&it->second, layer_id, expert_id, dst, bytes);
+}
+```
+
+- [ ] **Step 4: Build + smoke test (just init, no kernel dispatch yet)**
+
+```bash
+rsync -az --exclude=.git --exclude=build --exclude=build-local --exclude=models ~/llamacpp-moe-cache/ mi300:~/llamacpp-moe-cache/
+ssh mi300 "cd ~/llamacpp-moe-cache && cmake --build build -j --target llama-server 2>&1 | tail -5"
+```
+
+End-to-end model load with the SSD dir set requires Phase 3.3's `moe-pack` to have produced files. Defer the run-test to after Task 3.3.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ggml/src/ggml-cuda/moe-stream-source.{cu,cuh} ggml/src/ggml-cuda/buft-moe-stream.cu
+git commit -m "ggml-cuda: 3-tier MoE expert source (LRU + page cache + SSD pread)"
+```
+
+### Task 3.3: `tools/moe-pack` — GGUF → per-layer files
 
 **Files:**
 - Create: `tools/moe-pack/moe-pack.cpp`
+- Create: `tools/moe-pack/CMakeLists.txt`
 - Modify: `tools/CMakeLists.txt`
 
-- [ ] **Step 1: Write the converter (host-only, no GPU)**
+- [ ] **Step 1: Implement the converter**
 
 ```cpp
 // tools/moe-pack/moe-pack.cpp
-// Converts a GGUF MoE checkpoint into one binary file per MoE layer:
-//   <out_dir>/layer_NN.bin  with experts laid out contiguously, expert e
-//   at offset e * expert_bytes. No header, no metadata.
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sergey Subbotin
+//
+// Converts a GGUF MoE checkpoint into per-layer files for use with
+// llama.cpp --moe-stream-dir. One file per MoE layer, name layer_NN.bin,
+// experts laid out contiguously at offset e * expert_bytes.
 #include "ggml.h"
 #include "gguf.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <regex>
 #include <string>
+#include <vector>
+#include <map>
 
 int main(int argc, char **argv) {
-    if (argc != 3) { fprintf(stderr, "usage: moe-pack input.gguf out_dir\n"); return 2; }
-    const char *path = argv[1]; const char *out = argv[2];
-    mkdir(out, 0755);
-    gguf_init_params p { false, nullptr };
-    gguf_context *ctx = gguf_init_from_file(path, p);
-    if (!ctx) { fprintf(stderr, "gguf_init failed\n"); return 1; }
-    int n = gguf_get_n_tensors(ctx);
-    // Group tensors by layer index parsed from name (blk.<L>.ffn_*_exps.weight).
-    // For each layer, concatenate gate_w, up_w, down_w expert blobs in the
-    // same order GGUF stores them (already [expert, out, in] row-major).
-    // Write to <out>/layer_NN.bin. Skip non-MoE tensors.
-    // … (full enumeration omitted in this plan; TDD-extend)
-    gguf_free(ctx);
+    if (argc != 3) {
+        fprintf(stderr, "usage: moe-pack input.gguf out_dir\n");
+        return 2;
+    }
+    const char *gguf_path = argv[1];
+    const char *out_dir   = argv[2];
+    mkdir(out_dir, 0755);
+
+    gguf_init_params p { /*no_alloc*/ false, /*ctx*/ nullptr };
+    gguf_context *gguf = gguf_init_from_file(gguf_path, p);
+    if (!gguf) { fprintf(stderr, "gguf_init failed\n"); return 1; }
+
+    // Group MoE expert tensors by (layer, projection-name).
+    std::regex re("blk\\.(\\d+)\\.ffn_(gate|up|down)_exps\\.weight");
+    std::map<int, std::map<std::string, int>> by_layer;  // layer -> {proj -> tensor_id}
+    int n = gguf_get_n_tensors(gguf);
+    for (int i = 0; i < n; ++i) {
+        const char *name = gguf_get_tensor_name(gguf, i);
+        std::cmatch m;
+        if (!std::regex_match(name, m, re)) continue;
+        int layer = std::stoi(m[1]);
+        by_layer[layer][m[2]] = i;
+    }
+
+    // For each layer, write a file containing per-expert blobs in
+    // [gate, up, down] order.
+    for (auto &kv : by_layer) {
+        int layer = kv.first;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/layer_%02d.bin", out_dir, layer);
+        FILE *f = fopen(path, "wb");
+        if (!f) { fprintf(stderr, "fopen %s failed\n", path); return 1; }
+        for (const char *proj : {"gate", "up", "down"}) {
+            auto it = kv.second.find(proj);
+            if (it == kv.second.end()) continue;
+            int t = it->second;
+            // Use gguf API to read raw bytes for tensor t and write them.
+            // (Exact API: gguf_get_tensor_offset + read from file at that
+            // offset for size = gguf_get_tensor_size — adapt to the
+            // version of gguf the build uses.)
+            // For now: implementer fills in based on the actual gguf.h
+            // signature in this checkout.
+        }
+        fclose(f);
+        printf("[moe-pack] L%02d: wrote %s\n", layer, path);
+    }
+    gguf_free(gguf);
     return 0;
 }
 ```
 
-- [ ] **Step 2: Add to `tools/CMakeLists.txt`**
+- [ ] **Step 2: CMakeLists**
 
 ```cmake
-add_subdirectory(moe-pack)
-```
-
-And in `tools/moe-pack/CMakeLists.txt`:
-
-```cmake
+# tools/moe-pack/CMakeLists.txt
 add_executable(moe-pack moe-pack.cpp)
 target_link_libraries(moe-pack PRIVATE ggml)
 ```
 
-- [ ] **Step 3: Run on Qwen3-30B-A3B**
-
-```bash
-ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/moe-pack models/qwen3-30b-a3b-q4_k_m.gguf models/moe-ssd-30b/ && ls models/moe-ssd-30b/ | head -5 && du -sh models/moe-ssd-30b/"
+```cmake
+# tools/CMakeLists.txt — append
+add_subdirectory(moe-pack)
 ```
 
-Expected: 48 layer files (Qwen3-30B has 48 layers), total size ≈ expert weight subset of the GGUF.
+- [ ] **Step 3: Build + run on Qwen3-30B-A3B**
+
+```bash
+ssh mi300 "cd ~/llamacpp-moe-cache && cmake --build build -j --target moe-pack && build/bin/moe-pack models/qwen3-30b-a3b-q4_k_m.gguf /mnt/scratch/moe-stream-30b/"
+ssh mi300 "ls /mnt/scratch/moe-stream-30b/ | head -5 && du -sh /mnt/scratch/moe-stream-30b/"
+```
+
+Expected: 48 layer files, total size matches the expert subset of the GGUF (the non-expert tensors stay in the GGUF, served by the normal mmap path).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add tools/moe-pack/ tools/CMakeLists.txt
-git commit -m "tools: moe-pack — GGUF MoE → per-layer binary files for --moe-ssd-dir"
+git commit -m "tools: moe-pack — convert GGUF MoE expert tensors to per-layer files for --moe-stream-dir"
 ```
 
-### Task 3.4: End-to-end SSD streaming smoke test
+### Task 3.4: End-to-end load test (model loads, no inference yet)
 
-- [ ] **Step 1: Run with SSD streaming on, small cache**
+- [ ] **Step 1: Run llama-server with the streaming flags**
 
 ```bash
-ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-server -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 --moe-cache-mb 2048 --moe-ssd-dir models/moe-ssd-30b/ --port 8080 &"
-sleep 60
-curl -s http://mi300:8080/v1/models
-curl -s http://mi300:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"local","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":4}'
+ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-server -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 --moe-stream-dir /mnt/scratch/moe-stream-30b/ --moe-cache-mb 8192 --port 8080 2>&1 | head -40"
 ```
 
-Expected: `OK` response, no crashes. Cache stats logged on exit.
+Expected: model loads, init prints `[moe-stream] tier-1 LRU cache initialized: capacity=NNN experts (8192 MB pool)`. No inference request yet — Phase 4 wires the kernel.
 
-- [ ] **Step 2: Bench tok/s + cache hit rate at 2 GB / 4 GB / 8 GB cache sizes**
+If the server crashes at load (most likely cause: tensor data is needed during graph build but our buffer type's `set_tensor` is a no-op), the right fix is to land the simplest version of Phase 4's dispatch as a placeholder so the graph compiles, then iterate. Report BLOCKED if so.
 
-```bash
-for mb in 2048 4096 8192; do
-  ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-bench -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 --moe-cache-mb $mb --moe-ssd-dir models/moe-ssd-30b/ -p 256 -n 128 2>&1 | tail -3"
-done
-```
-
-Record numbers in `docs/benchmarks.md` (Phase 5).
-
-- [ ] **Step 3: Commit benchmark log**
-
-```bash
-mkdir -p docs/benchmarks
-cp /tmp/bench-*.log docs/benchmarks/  # or pipe directly
-git add docs/benchmarks/
-git commit -m "bench: MoE cache + SSD streaming numbers, Qwen3-30B-A3B on MI300X"
-```
+- [ ] **Step 2: No commit unless something needed adjusting in code.**
 
 ---
 
-## Phase 4 — gfx942-tuned fused MoE kernel
+## Phase 4 — custom MoE forward dispatch (gfx942 fused kernel)
 
-### Task 4.1: Port `kernels_fused_moe.hip.h` (the scalar path) into ggml-cuda with HIP guards
+The buffer type and source are in place; this phase makes the CUDA backend recognize MUL_MAT_ID where src0 lives in the moe_stream buffer type and dispatches our fused kernel against the K cached expert pointers.
+
+### Task 4.1: Port the Sergey-authored fused MoE kernel
 
 **Files:**
 - Create: `ggml/src/ggml-cuda/fused-moe-amd.cu`
 - Create: `ggml/src/ggml-cuda/fused-moe-amd.cuh`
-- Modify: `ggml/src/ggml-cuda/mmid.cu` (call site behind `#if defined(__HIP_PLATFORM_AMD__)`)
 
-- [ ] **Step 1: Refactor + relicense the kernel**
+- [ ] **Step 1: Read the source kernel** (license-allowed)
 
-Open `mi300-opt/rocm_infer/kernels_fused_moe.hip.h` (this is one of the three files we may consult, see License section). Copy the `fused_moe_gate_up_swiglu_mlx` and `fused_moe_down_mlx` kernel bodies into `ggml/src/ggml-cuda/fused-moe-amd.cu`, but:
-- Replace MLX-specific pack offsets (`EXP_GATE_W` etc.) with parameters passed from the launcher
-- Drop the MLX-quantization-only assumption — the layout struct is now per-call
-- Header gains MIT SPDX line: `// SPDX-License-Identifier: MIT`
-- Copyright header: `// Copyright (c) 2026 Sergey Subbotin`
-- Cite AITER (MIT) as the inspiration for the scalar dispatch shape
+The fused kernel is in `/home/sergey/flash-moe/.worktrees/mi300-opt/rocm_infer/kernels_fused_moe.hip.h`. **You may read this file** — it has a `Sergey Subbotin` copyright header and is one of the three files explicitly approved for reuse. Do NOT open `infer.hip`, `kernels.hip.h`, or any other file in `/home/sergey/flash-moe/`.
 
-- [ ] **Step 2: Wire from the cache lookup hook**
+Port the `fused_moe_gate_up_swiglu_mlx` and `fused_moe_down_mlx` kernels into the new files, with these adaptations:
+- Replace MLX-specific weight layout (4-bit packed nibbles + bf16 scale + bf16 bias per group of 64) with **Q4_K_M block layout** (`block_q4_K`, 144 bytes per 256 elements). Use llama.cpp's existing `dequantize_q4_K` helpers from `ggml/src/ggml-cuda/dequantize.cuh` to drive the inner loop — saves us re-deriving Q4_K dequant.
+- Take **K device pointers** (one per active expert) as `const void * const *` argument, not a packed weight blob.
+- Take the `ids` tensor pointer + the routing weights as additional inputs.
+- Output shape matches the existing MUL_MAT_ID output.
+- HIP guards: gate the gfx942-specific tunings behind `defined(__HIP_PLATFORM_AMD__) && defined(__gfx942__)`. Provide a generic CUDA fallback path (just calls llama.cpp's existing per-expert MMVQ in a loop) so `--moe-stream-dir` works on NVIDIA too, just slower.
 
-In `mmid.cu`, after the cache lookup yields a device pointer for each of K experts, on AMD/gfx942 path replace the K iterations of normal `mmvq`/`mmvf` with a single launch of the fused kernel:
+- [ ] **Step 2: Header**
 
 ```cpp
-#if defined(__HIP_PLATFORM_AMD__) && defined(__gfx942__)
-    if (use_fused_moe_amd && K == 4) {
-        launch_fused_moe_amd(d_expert_ptrs, ..., stream);
-    } else
-#endif
-    {
-        // existing per-expert dispatch
+// ggml/src/ggml-cuda/fused-moe-amd.cuh
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sergey Subbotin
+#pragma once
+#include "common.cuh"
+
+// Dispatches MUL_MAT_ID for tensors whose src0 is in the moe_stream buffer
+// type. K active experts per token; their device pointers come from the
+// LRU cache. Output is `dst` (one row per token, ne01 == hidden_dim).
+//
+// Returns false if the inputs aren't supported on this device (caller
+// falls back to a generic loop).
+bool ggml_cuda_moe_stream_mul_mat_id(
+    ggml_backend_cuda_context &ctx,
+    const ggml_tensor *src0,    // expert tensor (in moe_stream buffer)
+    const ggml_tensor *src1,    // input activations
+    const ggml_tensor *ids,     // routing decisions (top-K)
+    ggml_tensor *dst);
+```
+
+- [ ] **Step 3: Implementation skeleton + Q4_K_M kernel**
+
+This is the largest single task in the plan (~400 LOC). The implementer should land it in 3 sub-commits:
+- a) skeleton + dispatch wiring (calls into the existing per-expert loop as a placeholder)
+- b) replace placeholder with the fused kernel for the gate/up/SwiGLU path
+- c) replace with the fused kernel for the down path
+
+After each, smoke-test with `llama-server` + a one-token completion.
+
+- [ ] **Step 4: Wire into `ggml_cuda_mul_mat_id`**
+
+In `ggml/src/ggml-cuda/ggml-cuda.cu` (around line 2470, where the dispatch decisions are made), insert at the top:
+
+```cpp
+if (ggml_cuda_moe_stream_get_meta(src0)) {
+    if (ggml_cuda_moe_stream_mul_mat_id(ctx, src0, src1, ids, dst)) {
+        return;
     }
+    // Fall through if our path declined.
+}
 ```
 
-- [ ] **Step 3: Bench against baseline (no cache, no fused)**
+- [ ] **Step 5: End-to-end smoke test**
 
 ```bash
-ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-bench -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 -p 256 -n 128 --moe-cache-mb 8192 2>&1 | tail -3"
+ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-server -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 --moe-stream-dir /mnt/scratch/moe-stream-30b/ --moe-cache-mb 8192 --port 8080 &"
+sleep 60
+curl -s -m 60 -X POST http://mi300:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"local","messages":[{"role":"user","content":"Reply with OK only."}],"max_tokens":4}'
+ssh mi300 "pkill -f llama-server"
 ```
 
-Decision rule: keep if ≥5% improvement at 128-token decode over Phase 3 numbers. (The standalone +8% number from `mi300-opt` is for a different model — Qwen3.5-397B at MLX 4-bit. Q4_K_M layout in llama.cpp is different; expect smaller gains.)
+Expected: a sane response containing "OK". If garbled, the dequant or routing logic is wrong — diff against the no-cache baseline.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Bench**
 
 ```bash
-git add ggml/src/ggml-cuda/fused-moe-amd.{cu,cuh} ggml/src/ggml-cuda/mmid.cu
-git commit -m "ggml-cuda: gfx942 fused MoE kernel (gate+up+SwiGLU+down in 2 launches)"
+for cfg in 'baseline' 'stream-8g' 'stream-32g'; do
+  case $cfg in
+    baseline)   args="";;
+    stream-8g)  args="--moe-stream-dir /mnt/scratch/moe-stream-30b/ --moe-cache-mb 8192";;
+    stream-32g) args="--moe-stream-dir /mnt/scratch/moe-stream-30b/ --moe-cache-mb 32768";;
+  esac
+  ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-bench -m models/qwen3-30b-a3b-q4_k_m.gguf -ngl 99 -t 8 -p 256 -n 64 $args 2>&1 | tail -3"
+done | tee /tmp/bench-30b.log
+scp mi300:/tmp/bench-30b.log docs/bench-30b.log || cp /tmp/bench-30b.log docs/bench-30b.log
 ```
 
----
+Decision rule: keep if `stream-32g` is within 5% of baseline tg/s on Qwen3-30B (proves no regression when the model fits VRAM), AND the agent demo on Qwen3-235B (Phase 5) actually runs. The 30B model fitting in VRAM means cache adds no win there; the win is enabling >VRAM models to run at all.
+
+- [ ] **Step 7: Commit (3 sub-commits per Step 3 + bench commit)**
+
+```bash
+git add docs/bench-30b.log
+git commit -m "bench: Qwen3-30B-A3B baseline vs --moe-stream-dir cache 8 GB / 32 GB on MI300X"
+```
+
+### Task 4.2: Demo target — DeepSeek-V3 671B Q4_K_M (the headline)
+
+This is the model where streaming actually matters. ~340 GB Q4_K_M, exceeds MI300X's 192 GB VRAM. The whole pipeline (buffer type + source + fused kernel + cache) is exercised because experts must be evicted and refetched.
+
+- [ ] **Step 1: Download + pack** (do this in `screen` — multi-hour download)
+
+```bash
+ssh mi300 "cd /mnt/scratch/llamacpp-moe-cache/models/ && screen -dmS dl bash -c 'HF_HUB_ENABLE_HF_TRANSFER=1 hf download unsloth/DeepSeek-V3-GGUF DeepSeek-V3-Q4_K_M --local-dir . 2>&1 | tee /root/dl.log'"
+# (Actual repo / filename varies; pick the smallest available Q4_K_M variant from a verified uploader.)
+ssh mi300 "ls -la /mnt/scratch/llamacpp-moe-cache/models/DeepSeek-V3-Q4_K_M*.gguf"
+ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/moe-pack models/DeepSeek-V3-Q4_K_M.gguf /mnt/scratch/moe-stream-dsv3/"
+```
+
+- [ ] **Step 2: Run + bench**
+
+```bash
+ssh mi300 "cd ~/llamacpp-moe-cache && build/bin/llama-bench -m models/DeepSeek-V3-Q4_K_M.gguf -ngl 99 --moe-stream-dir /mnt/scratch/moe-stream-dsv3/ --moe-cache-mb 131072 -p 128 -n 64 2>&1 | tail -3"
+```
+
+Expected: model that wouldn't otherwise fit in 192 GB VRAM produces tokens. Headline number for the hackathon submission.
+
+- [ ] **Step 3: Commit benchmark result**
+
+```bash
+git add docs/bench-dsv3.log
+git commit -m "bench: DeepSeek-V3 671B Q4_K_M on a single MI300X via --moe-stream-dir"
+```
+
 
 ## Phase 5 — companion repo + agent demo + submission
 
