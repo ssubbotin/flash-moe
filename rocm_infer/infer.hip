@@ -33,6 +33,7 @@
 #include "kernels.hip.h"
 #include "kernels_aotriton_attn.hip.h"
 #include "kernels_fla_gdn.hip.h"
+#include "kernels_fused_moe.hip.h"
 
 // aotriton flash attention (Task 1.3) — gated behind FLASH_MOE_AOTRITON_FA env var.
 #include <aotriton/flash.h>
@@ -617,6 +618,13 @@ typedef struct {
     // Pre-allocated expert weights buffer (avoids per-layer hipMalloc)
     float *buf_expert_weights;  // [MAX_K] on GPU
 
+    // Fused MoE scratch (Task 2.2). Allocated only when FLASH_MOE_FUSED_MOE
+    // is set. buf_fused_moe_inter is K * MOE_INTERMEDIATE floats (post-SwiGLU
+    // intermediate); buf_fused_moe_ptrs is K device-side pointers to expert
+    // weight blobs.
+    void   **buf_fused_moe_ptrs;
+    float   *buf_fused_moe_inter;
+
     // HIP streams for I/O overlap
     hipStream_t stream_compute;
     hipStream_t stream_transfer;
@@ -999,6 +1007,17 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
 
     // Pre-allocated expert weights buffer
     CHECK_HIP(hipMalloc(&model->buf_expert_weights, MAX_K * sizeof(float)));
+
+    // Fused MoE scratch (Task 2.2). Allocated only when env flag is on.
+    if (getenv("FLASH_MOE_FUSED_MOE")) {
+        CHECK_HIP(hipMalloc(&model->buf_fused_moe_ptrs, MAX_K * sizeof(void *)));
+        CHECK_HIP(hipMalloc(&model->buf_fused_moe_inter, MAX_K * MOE_INTERMEDIATE * sizeof(float)));
+        printf("[init] fused MoE enabled (scratch: %.1f MB)\n",
+               (MAX_K * sizeof(void *) + MAX_K * MOE_INTERMEDIATE * sizeof(float)) / (1024.0 * 1024.0));
+    } else {
+        model->buf_fused_moe_ptrs = NULL;
+        model->buf_fused_moe_inter = NULL;
+    }
 
     // HIP streams for I/O overlap
     CHECK_HIP(hipStreamCreate(&model->stream_compute));
@@ -2043,43 +2062,61 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.expert_io += t1-t0; t0=t1; }
 
     // 7. Expert forward (K experts on GPU, using cached pointers)
-    for (int k = 0; k < K; k++) {
-        if (g_quant_format == 1) {
-            // GGUF expert layout
-            uint8_t *base = (uint8_t *)expert_ptrs[k];
-            launch_dequant_matvec_gguf((const void *)(base + g_gguf_gate_offset),
-                model->buf_normed, model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM,
-                g_gguf_gate_type);
-            launch_dequant_matvec_gguf((const void *)(base + g_gguf_up_offset),
-                model->buf_normed, model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM,
-                g_gguf_up_type);
-            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                          MOE_INTERMEDIATE);
-            launch_dequant_matvec_gguf((const void *)(base + g_gguf_down_offset),
-                model->buf_shared_gate, model->buf_expert_outs + k * HIDDEN_DIM,
-                HIDDEN_DIM, MOE_INTERMEDIATE, g_gguf_down_type_per_layer[layer_idx]);
-        } else {
-            // MLX expert layout
-            void *base = expert_ptrs[k];
+    if (g_quant_format != 1 && model->buf_fused_moe_ptrs) {
+        // Fused path (MLX only, opt-in via FLASH_MOE_FUSED_MOE).
+        // Copy K cache-slot pointers to the device pointer array.
+        CHECK_HIP(hipMemcpyAsync(model->buf_fused_moe_ptrs, expert_ptrs,
+                                 K * sizeof(void *),
+                                 hipMemcpyHostToDevice, model->stream_compute));
+        launch_fused_moe_mlx(
+            (const void * const *)model->buf_fused_moe_ptrs,
+            EXP_GATE_W, EXP_GATE_S, EXP_GATE_B,
+            EXP_UP_W,   EXP_UP_S,   EXP_UP_B,
+            EXP_DOWN_W, EXP_DOWN_S, EXP_DOWN_B,
+            model->buf_normed,
+            model->buf_fused_moe_inter,
+            model->buf_expert_outs,
+            HIDDEN_DIM, MOE_INTERMEDIATE, K,
+            model->stream_compute);
+    } else {
+        for (int k = 0; k < K; k++) {
+            if (g_quant_format == 1) {
+                // GGUF expert layout
+                uint8_t *base = (uint8_t *)expert_ptrs[k];
+                launch_dequant_matvec_gguf((const void *)(base + g_gguf_gate_offset),
+                    model->buf_normed, model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM,
+                    g_gguf_gate_type);
+                launch_dequant_matvec_gguf((const void *)(base + g_gguf_up_offset),
+                    model->buf_normed, model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM,
+                    g_gguf_up_type);
+                launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                              MOE_INTERMEDIATE);
+                launch_dequant_matvec_gguf((const void *)(base + g_gguf_down_offset),
+                    model->buf_shared_gate, model->buf_expert_outs + k * HIDDEN_DIM,
+                    HIDDEN_DIM, MOE_INTERMEDIATE, g_gguf_down_type_per_layer[layer_idx]);
+            } else {
+                // MLX expert layout
+                void *base = expert_ptrs[k];
 
-            uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);
-            uint16_t *gate_s = (uint16_t *)((char *)base + EXP_GATE_S);
-            uint16_t *gate_b = (uint16_t *)((char *)base + EXP_GATE_B);
-            uint32_t *up_w   = (uint32_t *)((char *)base + EXP_UP_W);
-            uint16_t *up_s   = (uint16_t *)((char *)base + EXP_UP_S);
-            uint16_t *up_b   = (uint16_t *)((char *)base + EXP_UP_B);
-            uint32_t *down_w = (uint32_t *)((char *)base + EXP_DOWN_W);
-            uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
-            uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
+                uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);
+                uint16_t *gate_s = (uint16_t *)((char *)base + EXP_GATE_S);
+                uint16_t *gate_b = (uint16_t *)((char *)base + EXP_GATE_B);
+                uint32_t *up_w   = (uint32_t *)((char *)base + EXP_UP_W);
+                uint16_t *up_s   = (uint16_t *)((char *)base + EXP_UP_S);
+                uint16_t *up_b   = (uint16_t *)((char *)base + EXP_UP_B);
+                uint32_t *down_w = (uint32_t *)((char *)base + EXP_DOWN_W);
+                uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
+                uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-            launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
-                                  model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
-            launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
-                                  model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
-            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                          MOE_INTERMEDIATE);
-            launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
-                                  model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+                launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
+                                      model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
+                                      model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+                launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                              MOE_INTERMEDIATE);
+                launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
+                                      model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            }
         }
     }
 

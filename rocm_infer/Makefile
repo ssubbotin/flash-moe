@@ -31,7 +31,7 @@ TARGET = infer
 tokenizer_impl.o: tokenizer_impl.c ../metal_infer/tokenizer.h
 	gcc -O2 -c tokenizer_impl.c -o tokenizer_impl.o
 
-infer.o: infer.hip kernels.hip.h kernels_aotriton_attn.hip.h kernels_fla_gdn.hip.h ../metal_infer/tokenizer.h
+infer.o: infer.hip kernels.hip.h kernels_aotriton_attn.hip.h kernels_fla_gdn.hip.h kernels_fused_moe.hip.h ../metal_infer/tokenizer.h
 	$(HIPCC) $(CFLAGS) -c infer.hip -o infer.o
 
 $(TARGET): infer.o tokenizer_impl.o
