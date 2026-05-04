@@ -2065,6 +2065,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     if (g_quant_format != 1 && model->buf_fused_moe_ptrs) {
         // Fused path (MLX only, opt-in via FLASH_MOE_FUSED_MOE).
         // Copy K cache-slot pointers to the device pointer array.
+        static const int s_use_moe_mfma = (getenv("FLASH_MOE_MOE_MFMA") != NULL) ? 1 : 0;
         CHECK_HIP(hipMemcpyAsync(model->buf_fused_moe_ptrs, expert_ptrs,
                                  K * sizeof(void *),
                                  hipMemcpyHostToDevice, model->stream_compute));
@@ -2077,6 +2078,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             model->buf_fused_moe_inter,
             model->buf_expert_outs,
             HIDDEN_DIM, MOE_INTERMEDIATE, K,
+            s_use_moe_mfma,
             model->stream_compute);
     } else {
         for (int k = 0; k < K; k++) {
