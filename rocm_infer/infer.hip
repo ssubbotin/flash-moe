@@ -31,6 +31,13 @@
 #include <hip/hip_runtime.h>
 
 #include "kernels.hip.h"
+#include "kernels_aotriton_attn.hip.h"
+
+// aotriton flash attention (Task 1.3) — gated behind FLASH_MOE_AOTRITON_FA env var.
+#include <aotriton/flash.h>
+#include <aotriton/runtime.h>
+#include <aotriton/util.h>
+#include <aotriton/dtypes.h>
 
 // tokenizer.h: declarations only (impl in tokenizer_impl.c, linked separately)
 extern "C" {
@@ -592,6 +599,13 @@ typedef struct {
     float *buf_q;             // [NUM_ATTN_HEADS * HEAD_DIM] deinterleaved Q
     float *buf_q_gate;        // [NUM_ATTN_HEADS * HEAD_DIM] Q gate
 
+    // bf16 staging buffers for aotriton::v2::flash::attn_fwd
+    // (allocated only if FLASH_MOE_AOTRITON_FA is set; NULL otherwise).
+    uint16_t *buf_q_bf16;       // [NUM_ATTN_HEADS * HEAD_DIM]
+    uint16_t *buf_attn_out_bf16;// [NUM_ATTN_HEADS * HEAD_DIM]
+    uint16_t *buf_kv_k_bf16;    // [MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM]
+    uint16_t *buf_kv_v_bf16;    // [MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM]
+
     // Logits
     float *buf_logits;  // [VOCAB_SIZE] on GPU
     float *h_logits;    // [VOCAB_SIZE] pinned host memory
@@ -960,6 +974,23 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
     CHECK_HIP(hipMalloc(&model->buf_attn_scores, NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)));
     CHECK_HIP(hipMalloc(&model->buf_q, NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)));
     CHECK_HIP(hipMalloc(&model->buf_q_gate, NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)));
+
+    // aotriton bf16 staging buffers (Task 1.3). Allocated once on init even
+    // if the env flag is off — total cost ~16 MB scratch, dwarfed by KV cache.
+    if (getenv("FLASH_MOE_AOTRITON_FA")) {
+        CHECK_HIP(hipMalloc(&model->buf_q_bf16, NUM_ATTN_HEADS * HEAD_DIM * sizeof(uint16_t)));
+        CHECK_HIP(hipMalloc(&model->buf_attn_out_bf16, NUM_ATTN_HEADS * HEAD_DIM * sizeof(uint16_t)));
+        CHECK_HIP(hipMalloc(&model->buf_kv_k_bf16, MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM * sizeof(uint16_t)));
+        CHECK_HIP(hipMalloc(&model->buf_kv_v_bf16, MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM * sizeof(uint16_t)));
+        printf("[init] aotriton flash attention enabled (bf16 staging: %.1f MB)\n",
+               (2 * MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM * sizeof(uint16_t) +
+                2 * NUM_ATTN_HEADS * HEAD_DIM * sizeof(uint16_t)) / (1024.0 * 1024.0));
+    } else {
+        model->buf_q_bf16 = NULL;
+        model->buf_attn_out_bf16 = NULL;
+        model->buf_kv_k_bf16 = NULL;
+        model->buf_kv_v_bf16 = NULL;
+    }
 
     // Logits
     CHECK_HIP(hipMalloc(&model->buf_logits, VOCAB_SIZE * sizeof(float)));
@@ -1555,17 +1586,100 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
         CHECK_HIP(hipMemcpy(model->buf_q, h_q, NUM_ATTN_HEADS * HEAD_DIM * sizeof(float), hipMemcpyHostToDevice));
 
-        attn_scores<<<seq_len * NUM_ATTN_HEADS, 256>>>(
-            model->buf_q, model->kv_k[layer_idx], model->buf_attn_scores,
-            HEAD_DIM, kv_dim, seq_len, MAX_SEQ_LEN, scale, heads_per_kv, seq_len);
-
-        attn_softmax<<<NUM_ATTN_HEADS, 256>>>(
-            model->buf_attn_scores, seq_len, MAX_SEQ_LEN);
-
         int attn_threads = NUM_ATTN_HEADS * HEAD_DIM;
-        attn_values<<<(attn_threads + 255) / 256, 256>>>(
-            model->buf_attn_scores, model->kv_v[layer_idx], model->buf_attn_out,
-            HEAD_DIM, kv_dim, seq_len, MAX_SEQ_LEN, heads_per_kv);
+
+        if (model->buf_q_bf16) {
+            // ------------------------------------------------------------
+            // Path A: aotriton::v2::flash::attn_fwd (params struct, kVersion=1)
+            // ------------------------------------------------------------
+            // Convert Q (32×256) and the seq_len-prefix of K/V (seq_len × 2 ×
+            // 256) from fp32 to bf16. KV cache stays fp32 (the rest of the
+            // engine reads it directly), so we restage into a bf16 scratch
+            // every call. That's seq_len × 1024 bytes per call per layer,
+            // negligible vs the kernel time.
+            f32_to_bf16_kernel<<<(attn_threads + 255) / 256, 256>>>(
+                model->buf_q, model->buf_q_bf16, attn_threads);
+            int kv_bytes = seq_len * kv_dim;
+            f32_to_bf16_kernel<<<(kv_bytes + 255) / 256, 256>>>(
+                model->kv_k[layer_idx], model->buf_kv_k_bf16, kv_bytes);
+            f32_to_bf16_kernel<<<(kv_bytes + 255) / 256, 256>>>(
+                model->kv_v[layer_idx], model->buf_kv_v_bf16, kv_bytes);
+
+            using namespace aotriton;
+            using T0 = TensorView<0>;
+            using T1 = TensorView<1>;
+            using T2 = TensorView<2>;
+            using T4 = TensorView<4>;
+
+            // Q  : [B=1, H_q=NUM_ATTN_HEADS, Sq=1,        D=HEAD_DIM]
+            //      contiguous (NUM_ATTN_HEADS × HEAD_DIM)
+            T4 Q(reinterpret_cast<intptr_t>(model->buf_q_bf16),
+                 {1u, (uint64_t)NUM_ATTN_HEADS, 1u, (uint64_t)HEAD_DIM},
+                 {(uint64_t)(NUM_ATTN_HEADS * HEAD_DIM), (uint64_t)HEAD_DIM, (uint64_t)HEAD_DIM, 1u},
+                 DType::kBFloat16);
+            // K/V scratch is laid out the same as kv_k: [Sk, NUM_KV_HEADS, D].
+            // We view it as [B=1, H_k=NUM_KV_HEADS, Sk, D] using strides:
+            //   dim 1 (head) stride = HEAD_DIM (adjacent KV heads at same Sk)
+            //   dim 2 (Sk)   stride = kv_dim   (next time-step)
+            T4 K(reinterpret_cast<intptr_t>(model->buf_kv_k_bf16),
+                 {1u, (uint64_t)NUM_KV_HEADS, (uint64_t)seq_len, (uint64_t)HEAD_DIM},
+                 {(uint64_t)(MAX_SEQ_LEN * kv_dim), (uint64_t)HEAD_DIM, (uint64_t)kv_dim, 1u},
+                 DType::kBFloat16);
+            T4 V(reinterpret_cast<intptr_t>(model->buf_kv_v_bf16),
+                 {1u, (uint64_t)NUM_KV_HEADS, (uint64_t)seq_len, (uint64_t)HEAD_DIM},
+                 {(uint64_t)(MAX_SEQ_LEN * kv_dim), (uint64_t)HEAD_DIM, (uint64_t)kv_dim, 1u},
+                 DType::kBFloat16);
+            T4 Out(reinterpret_cast<intptr_t>(model->buf_attn_out_bf16),
+                   {1u, (uint64_t)NUM_ATTN_HEADS, 1u, (uint64_t)HEAD_DIM},
+                   {(uint64_t)(NUM_ATTN_HEADS * HEAD_DIM), (uint64_t)HEAD_DIM, (uint64_t)HEAD_DIM, 1u},
+                   DType::kBFloat16);
+
+            v3::flash::attn_fwd_params p;
+            p.Q = Q; p.K = K; p.V = V; p.Out = Out;
+            p.B = T4();                  // no bias
+            p.A = T2();                  // no alibi
+            p.L = T2();                  // no LSE output
+            p.cu_seqlens_q = T1();
+            p.cu_seqlens_k = T1();
+            p.Max_seqlen_q = 1;
+            p.Max_seqlen_k = seq_len;
+            p.Sm_scale = scale;
+            p.dropout_p = 0.0f;
+            p.philox_seed_ptr = T0();
+            p.philox_offset1  = T0();
+            p.philox_offset2  = 0;
+            p.philox_seed_output = T0();
+            p.philox_offset_output = T0();
+            p.encoded_softmax = T4();
+            p.persistent_atomic_counter = T0();
+            p.causal_type = v3::flash::CausalType::None;  // Sq=1 → causal trivial
+            p.varlen_type = v3::flash::VarlenType::None;
+            p.window_left = 0;
+            p.window_right = 0;
+
+            hipError_t aerr = v3::flash::attn_fwd(p, v3::flash::attn_fwd_params::kVersion, Stream(0));
+            if (aerr != hipSuccess) {
+                fprintf(stderr, "aotriton::attn_fwd failed: %s\n", hipGetErrorString(aerr));
+                exit(1);
+            }
+
+            bf16_to_f32_kernel<<<(attn_threads + 255) / 256, 256>>>(
+                model->buf_attn_out_bf16, model->buf_attn_out, attn_threads);
+        } else {
+            // ------------------------------------------------------------
+            // Path B: existing three-kernel attention (fallback / default)
+            // ------------------------------------------------------------
+            attn_scores<<<seq_len * NUM_ATTN_HEADS, 256>>>(
+                model->buf_q, model->kv_k[layer_idx], model->buf_attn_scores,
+                HEAD_DIM, kv_dim, seq_len, MAX_SEQ_LEN, scale, heads_per_kv, seq_len);
+
+            attn_softmax<<<NUM_ATTN_HEADS, 256>>>(
+                model->buf_attn_scores, seq_len, MAX_SEQ_LEN);
+
+            attn_values<<<(attn_threads + 255) / 256, 256>>>(
+                model->buf_attn_scores, model->kv_v[layer_idx], model->buf_attn_out,
+                HEAD_DIM, kv_dim, seq_len, MAX_SEQ_LEN, heads_per_kv);
+        }
 
         // Sigmoid gate: attn_out *= sigmoid(q_gate)
         CHECK_HIP(hipMemcpy(model->buf_q_gate, h_qg,

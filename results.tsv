@@ -37,3 +37,4 @@ ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.32	0	5.5	keep	C/HIP gfx942 BASELINE:
 ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.26	0	5.5	keep	C/HIP gfx942 BASELINE: warm OS cache, 30 tokens, VRAM cache OFF (DISABLE_VRAM_CACHE=1) (MI300X)
 ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	7.13	0	5.5	keep	C/HIP gfx942 BASELINE: warm OS cache, 30 tokens, VRAM cache ~184GB (default, MI300X)
 ca14373	Qwen3.5-397B-A17B-4bit	397.0	17.0	8.99	0	5.5	keep	C/HIP gfx942 BASELINE: warm OS cache, 100 tokens, VRAM cache ~184GB (default, MI300X)
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	7.05	0	5.5	kept-opt-in	C/HIP gfx942: aotriton v3::flash::attn_fwd for full-attn layers (FLASH_MOE_AOTRITON_FA=1). 30/100/200 tokens: -1.3% / -0.3% / +0.1% vs three-kernel baseline. bf16 staging cost cancels fusion benefit at Sq=1, head_dim=256, GQA-16. Path kept gated, default off.
